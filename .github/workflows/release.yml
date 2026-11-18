@@ -194,6 +194,8 @@ jobs:
           # This version's section of Proton's changelog.md, without its heading.
           changes=$(awk -v v="## [$VERSION]" '$0 == v {on=1; next} on && /^## \[/ {exit} on' src/changelog.md \
                     | sed -e 's/^###/####/')
+          # (Set the fallback here: an apostrophe inside ${var:-...} in a here-doc breaks bash.)
+          [[ -n $changes ]] || changes="See [Proton's changelog](https://github.com/$UPSTREAM/blob/$SHA/changelog.md)."
           cat > notes.md <<EOF
           **Unofficial** arm64 (aarch64) Linux build of [Lumo Desktop](https://github.com/$UPSTREAM) $VERSION. Not made, signed or supported by Proton.
 
@@ -219,7 +221,7 @@ jobs:
           - Crash reports don't go to Proton (their reporting key isn't in the public source).
 
           ### What's new in $VERSION (from Proton's changelog)
-          ${changes:-See [Proton's changelog](https://github.com/$UPSTREAM/blob/$SHA/changelog.md).}
+          $changes
           EOF
           cat notes.md
 
