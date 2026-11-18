@@ -1,0 +1,189 @@
+# Unofficial arm64 (aarch64) Linux builds of Proton's Lumo Desktop.
+#
+# Proton's pushes can't trigger workflows in a fork, so this checks
+# ProtonLumo/lumo-desktop on a schedule. When master points at a commit that
+# has no release here yet, it builds that commit, unchanged, on GitHub's arm64
+# runner and publishes a release tagged at that exact upstream commit.
+name: Build arm64 release
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream commit already has a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: ProtonLumo/lumo-desktop
+  # Without this the app loads https://lumo.proton.dev (Proton's internal dev
+  # site, src-tauri/src/lib.rs) and shows "Unacceptable TLS certificate".
+  LUMO_URL: https://lumo.proton.me
+
+jobs:
+  mirror:
+    name: Mirror upstream master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Force master to match ProtonLumo/lumo-desktop
+        run: |
+          git init -q mirror && cd mirror
+          git fetch -q "https://github.com/$UPSTREAM.git" master
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" FETCH_HEAD:refs/heads/master
+
+  check:
+    name: Check for a new upstream commit
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      sha: ${{ steps.check.outputs.sha }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - id: check
+        run: |
+          sha=$(gh api "repos/$UPSTREAM/commits/master" --jq .sha)
+          version=$(gh api "repos/$UPSTREAM/contents/package.json?ref=$sha" --jq .content | base64 -d | jq -r .version)
+          echo "Upstream master: $sha (package.json $version)"
+
+          # Tags here point at the upstream commit they were built from.
+          tag=""
+          while read -r tsha ref; do
+            [[ $tsha == "$sha" ]] || continue
+            t=${ref#refs/tags/}
+            if gh release view "$t" >/dev/null 2>&1 && [[ "${{ inputs.force }}" != "true" ]]; then
+              echo "Release $t already exists for $sha; nothing to do."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tag=$t
+          done < <(git ls-remote --tags "https://github.com/$GH_REPO.git")
+
+          if [[ -z $tag ]]; then
+            tag="v$version"
+            # Same version, different commit: keep both, tell them apart by commit.
+            if git ls-remote --exit-code --tags "https://github.com/$GH_REPO.git" "refs/tags/$tag" >/dev/null; then
+              tag="v$version-${sha:0:7}"
+            fi
+          fi
+          echo "Will build $tag from $sha"
+          {
+            echo "build=true"
+            echo "sha=$sha"
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and release
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    env:
+      SHA: ${{ needs.check.outputs.sha }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # linuxdeploy can't use FUSE on the runner, and its bundled strip
+      # predates the toolchain's object format.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      NO_STRIP: "true"
+    steps:
+      - name: Check out upstream source (unmodified)
+        uses: actions/checkout@v4
+        with:
+          repository: ProtonLumo/lumo-desktop
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            build-essential pkg-config file patchelf xdg-utils \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libsoup-3.0-dev
+
+      - name: Install JS dependencies
+        working-directory: src
+        run: npm ci --no-audit --no-fund
+
+      - name: Sync the app's own version in Cargo.lock
+        working-directory: src/src-tauri
+        run: |
+          # Upstream's Cargo.lock can lag the app's own version (0.5.8 in the
+          # 0.5.9 commit). --workspace rewrites only that entry; this fails the
+          # build if any dependency moved.
+          cargo update --workspace
+          changed=$(git diff --numstat Cargo.lock)
+          echo "Cargo.lock changes: ${changed:-none}"
+          if [[ -n $changed && $changed != $'1\t1\tsrc-tauri/Cargo.lock' ]]; then
+            git diff Cargo.lock
+            echo "::error::cargo update --workspace changed dependencies, not just the app's version"
+            exit 1
+          fi
+
+      - name: Build
+        working-directory: src
+        run: npm run build -- --bundles deb,rpm,appimage
+
+      - name: Verify the binary
+        working-directory: src/src-tauri/target/release
+        run: |
+          file lumo-desktop
+          file lumo-desktop | grep -q 'ARM aarch64'
+          grep -q "$LUMO_URL" lumo-desktop || { echo "::error::LUMO_URL is not in the binary"; exit 1; }
+
+      - name: Collect release files
+        run: |
+          mkdir out
+          b=src/src-tauri/target/release/bundle
+          cp $b/deb/*.deb $b/rpm/*.rpm $b/appimage/*.AppImage out/
+          # Plain archive of the installed file tree (same files as the .deb),
+          # for distros that package it themselves, e.g. an Arch PKGBUILD.
+          tar -C $b/deb/*/data -czf "out/lumo-desktop-$VERSION-aarch64.tar.gz" usr
+          cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Tag the upstream commit and publish the release
+        run: |
+          cat > notes.md <<EOF
+          **Unofficial** arm64 (aarch64) Linux build of [Lumo Desktop](https://github.com/$UPSTREAM). Not made, signed or supported by Proton.
+
+          Built from upstream commit [\`${SHA:0:7}\`](https://github.com/$UPSTREAM/commit/$SHA) with no changes to Proton's code, by [this workflow](https://github.com/$GH_REPO/blob/arm64-builds/.github/workflows/release.yml) ([run](https://github.com/$GH_REPO/actions/runs/${{ github.run_id }})). The only build setting is \`LUMO_URL=$LUMO_URL\`, as in Proton's own releases.
+
+          | File | For |
+          |---|---|
+          | \`.deb\` | Debian, Ubuntu 24.04+ |
+          | \`.rpm\` | Fedora 40+ |
+          | \`.AppImage\` | other distros (needs WebKitGTK 4.1 installed) |
+          | \`.tar.gz\` | packaging it yourself (the \`/usr\` tree from the \`.deb\`) |
+
+          - Install it with your package manager, not by running the bare binary: browser sign-in comes back through \`proton-lumo://\` links, which only an installed desktop entry handles.
+          - The in-app updater does nothing on arm64 Linux (Proton publishes no arm64 update). Update by installing the next release.
+          - Crash reports don't go to Proton (their reporting key isn't in the public source).
+          EOF
+          git -C src push "https://x-access-token:${{ github.token }}@github.com/$GH_REPO.git" "$SHA:refs/tags/$TAG" -f
+          gh release create "$TAG" out/* \
+            --verify-tag \
+            --title "Lumo $VERSION (unofficial arm64)" \
+            --notes-file notes.md
