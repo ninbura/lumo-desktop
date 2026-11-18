@@ -32,7 +32,7 @@ env:
 jobs:
   mirror:
     name: Mirror upstream master
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Force master to match ProtonLumo/lumo-desktop
         run: |
@@ -42,7 +42,7 @@ jobs:
 
   check:
     name: Check for a new upstream commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.check.outputs.build }}
       sha: ${{ steps.check.outputs.sha }}
@@ -103,14 +103,14 @@ jobs:
       NO_STRIP: "true"
     steps:
       - name: Check out upstream source (unmodified)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ProtonLumo/lumo-desktop
           ref: ${{ needs.check.outputs.sha }}
           path: src
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
