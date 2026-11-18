@@ -1,14 +1,16 @@
 # Unofficial arm64 (aarch64) Linux builds of Proton's Lumo Desktop.
 #
-# Proton's pushes can't trigger workflows in a fork, so this checks
-# ProtonLumo/lumo-desktop on a schedule. When master points at a commit that
-# has no release here yet, it builds that commit, unchanged, on GitHub's arm64
-# runner and publishes a release tagged at that exact upstream commit.
+# Proton's pushes can't trigger workflows in a fork, so this checks hourly.
+# It builds only what Proton has released: the version in Proton's release
+# manifest (version.json) must match package.json on ProtonLumo/lumo-desktop's
+# master. That commit is built unchanged on GitHub's arm64 runner, published as
+# a release tagged at that exact upstream commit, with a signed build
+# provenance attestation for every file.
 name: Build arm64 release
 
 on:
   schedule:
-    - cron: "17 */4 * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -17,7 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -25,6 +27,8 @@ concurrency:
 
 env:
   UPSTREAM: ProtonLumo/lumo-desktop
+  # Proton's release manifest for Linux: the current stable version.
+  MANIFEST: https://proton.me/download/lumo/desktop/linux/v1/version.json
   # Without this the app loads https://lumo.proton.dev (Proton's internal dev
   # site, src-tauri/src/lib.rs) and shows "Unacceptable TLS certificate".
   LUMO_URL: https://lumo.proton.me
@@ -33,6 +37,8 @@ jobs:
   mirror:
     name: Mirror upstream master
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Force master to match ProtonLumo/lumo-desktop
         run: |
@@ -41,7 +47,7 @@ jobs:
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" FETCH_HEAD:refs/heads/master
 
   check:
-    name: Check for a new upstream commit
+    name: Check for a new Proton release
     runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.check.outputs.build }}
@@ -54,9 +60,17 @@ jobs:
     steps:
       - id: check
         run: |
+          skip() { echo "$1"; echo "build=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          released=$(curl -fsSL "$MANIFEST" | jq -r '[.Releases[] | select(.CategoryName == "Stable")][0].Version')
           sha=$(gh api "repos/$UPSTREAM/commits/master" --jq .sha)
           version=$(gh api "repos/$UPSTREAM/contents/package.json?ref=$sha" --jq .content | base64 -d | jq -r .version)
+          echo "Proton's stable release: $released"
           echo "Upstream master: $sha (package.json $version)"
+
+          # Only build what Proton has released: not unreleased work on master,
+          # and not before the matching source reaches GitHub.
+          [[ $version == "$released" ]] || skip "master is $version, Proton's release is $released; waiting until they match."
 
           # Tags here point at the upstream commit they were built from.
           tag=""
@@ -64,9 +78,7 @@ jobs:
             [[ $tsha == "$sha" ]] || continue
             t=${ref#refs/tags/}
             if gh release view "$t" >/dev/null 2>&1 && [[ "${{ inputs.force }}" != "true" ]]; then
-              echo "Release $t already exists for $sha; nothing to do."
-              echo "build=false" >> "$GITHUB_OUTPUT"
-              exit 0
+              skip "Release $t already exists for $sha; nothing to do."
             fi
             tag=$t
           done < <(git ls-remote --tags "https://github.com/$GH_REPO.git")
@@ -91,6 +103,10 @@ jobs:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write      # tag and release
+      id-token: write      # sign the provenance attestation
+      attestations: write  # store it
     env:
       SHA: ${{ needs.check.outputs.sha }}
       VERSION: ${{ needs.check.outputs.version }}
@@ -102,19 +118,23 @@ jobs:
       APPIMAGE_EXTRACT_AND_RUN: "1"
       NO_STRIP: "true"
     steps:
+      # Third-party actions are pinned to exact commits (tag in the comment).
       - name: Check out upstream source (unmodified)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ProtonLumo/lumo-desktop
           ref: ${{ needs.check.outputs.sha }}
           path: src
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11
+        with:
+          toolchain: stable
 
       - name: Install build dependencies
         run: |
@@ -164,13 +184,29 @@ jobs:
           tar -C $b/deb/*/data -czf "out/lumo-desktop-$VERSION-aarch64.tar.gz" usr
           cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
-      - name: Tag the upstream commit and publish the release
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*
+
+      - name: Write release notes
         run: |
+          # This version's section of Proton's changelog.md, without its heading.
+          changes=$(awk -v v="## [$VERSION]" '$0 == v {on=1; next} on && /^## \[/ {exit} on' src/changelog.md \
+                    | sed -e 's/^###/####/')
           cat > notes.md <<EOF
-          **Unofficial** arm64 (aarch64) Linux build of [Lumo Desktop](https://github.com/$UPSTREAM). Not made, signed or supported by Proton.
+          **Unofficial** arm64 (aarch64) Linux build of [Lumo Desktop](https://github.com/$UPSTREAM) $VERSION. Not made, signed or supported by Proton.
 
-          Built from upstream commit [\`${SHA:0:7}\`](https://github.com/$UPSTREAM/commit/$SHA) with no changes to Proton's code, by [this workflow](https://github.com/$GH_REPO/blob/arm64-builds/.github/workflows/release.yml) ([run](https://github.com/$GH_REPO/actions/runs/${{ github.run_id }})). The only build setting is \`LUMO_URL=$LUMO_URL\`, as in Proton's own releases.
+          Built from upstream commit [\`${SHA:0:7}\`](https://github.com/$UPSTREAM/commit/$SHA), the source of Proton's $VERSION release, with no changes to Proton's code, by [this workflow](https://github.com/$GH_REPO/blob/arm64-builds/.github/workflows/release.yml) ([run](https://github.com/$GH_REPO/actions/runs/${{ github.run_id }})). The only build setting is \`LUMO_URL=$LUMO_URL\`, as in Proton's own releases.
 
+          ### Verify a download
+          Every file has a signed build provenance attestation (built by this workflow, from this commit):
+          \`\`\`
+          gh attestation verify <file> -R $GH_REPO
+          \`\`\`
+          Or compare against \`SHA256SUMS\`.
+
+          ### Files
           | File | For |
           |---|---|
           | \`.deb\` | Debian, Ubuntu 24.04+ |
@@ -181,9 +217,22 @@ jobs:
           - Install it with your package manager, not by running the bare binary: browser sign-in comes back through \`proton-lumo://\` links, which only an installed desktop entry handles.
           - The in-app updater does nothing on arm64 Linux (Proton publishes no arm64 update). Update by installing the next release.
           - Crash reports don't go to Proton (their reporting key isn't in the public source).
+
+          ### What's new in $VERSION (from Proton's changelog)
+          ${changes:-See [Proton's changelog](https://github.com/$UPSTREAM/blob/$SHA/changelog.md).}
           EOF
+          cat notes.md
+
+      - name: Tag the upstream commit and publish the release
+        run: |
           git -C src push "https://x-access-token:${{ github.token }}@github.com/$GH_REPO.git" "$SHA:refs/tags/$TAG" -f
-          gh release create "$TAG" out/* \
-            --verify-tag \
-            --title "Lumo $VERSION (unofficial arm64)" \
-            --notes-file notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Forced rebuild of a commit that already has a release: replace its files and notes.
+            gh release upload "$TAG" out/* --clobber
+            gh release edit "$TAG" --title "Lumo $VERSION (unofficial arm64)" --notes-file notes.md
+          else
+            gh release create "$TAG" out/* \
+              --verify-tag \
+              --title "Lumo $VERSION (unofficial arm64)" \
+              --notes-file notes.md
+          fi

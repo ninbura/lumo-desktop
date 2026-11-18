@@ -10,8 +10,18 @@
 ## How it works
 - **`master`** mirrors [ProtonLumo/lumo-desktop](https://github.com/ProtonLumo/lumo-desktop) exactly. It's force-updated from upstream and never changed here.
 - **`arm64-builds`** (this branch) holds only the build workflow, [`.github/workflows/release.yml`](.github/workflows/release.yml).
-- Every 4 hours, the workflow checks Proton's `master`. When it points at a commit with no release here, it builds that commit on GitHub's arm64 runner and publishes a release. The release's tag points at that exact upstream commit, so you can see precisely what was built.
+- Every hour, the workflow compares Proton's [release manifest](https://proton.me/download/lumo/desktop/linux/v1/version.json) with `package.json` on Proton's `master`. It builds only when they match, so you get exactly the version Proton has released, never unreleased work. It then builds that commit on GitHub's arm64 runner and publishes a release, usually within about an hour of Proton's. The release's tag points at that exact upstream commit, and its notes include that version's section of Proton's changelog.
+- Third-party actions in the workflow are pinned to exact commits.
 - Run it by hand: Actions → *Build arm64 release* → *Run workflow* (tick *force* to rebuild a commit that already has a release).
+
+## Verify a download
+Every release file has a signed [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations): proof that it was built by this repo's workflow, from the tagged commit. With the GitHub CLI:
+
+```bash
+gh attestation verify lumo_0.5.9_arm64.deb -R ninbura/lumo-desktop
+```
+
+Each release also has `SHA256SUMS`.
 
 ## What differs from Proton's builds
 - **Nothing in the code.** The one build setting is `LUMO_URL=https://lumo.proton.me`. Without it the source defaults to Proton's internal development site, and the app only shows "Unacceptable TLS certificate".
