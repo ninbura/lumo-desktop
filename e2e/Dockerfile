@@ -1,16 +1,16 @@
 # Toolchain image for the bridge E2E suite.
 #
-# On Linux, Tauri renders with WebKitGTK, which ships WebKitWebDriver — so the real
-# app can be driven by WebdriverIO here, which is impossible against macOS WKWebView.
+# WebdriverIO connects to the app's embedded WebDriver server. WebKitGTK remains
+# the real rendering engine; no external tauri-driver or WebKitWebDriver is needed.
 # Deliberately toolchain-only: the app is compiled at run time from the mounted
 # working tree (see run.sh), so the image stays reusable across code changes and the
 # cargo cache lives in a volume rather than a layer.
-FROM ubuntu:24.04
+# 22.04 because build-linux ships from this image: the binary needs this glibc or newer.
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# libwebkit2gtk-4.1-dev is the engine Tauri v2 links against; webkit2gtk-driver
-# provides WebKitWebDriver, which tauri-driver proxies; libdbus-1-dev is what the keyring
+# libwebkit2gtk-4.1-dev is the engine Tauri v2 links against; libdbus-1-dev is what the keyring
 # crate links; libxdo/appindicator/rsvg by Tauri itself.
 #
 # No Secret Service is installed on purpose: creating its default collection needs the
@@ -31,11 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev \
         libxdo-dev \
         pkg-config \
-        webkit2gtk-driver \
+        xauth \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# Ubuntu 24.04 ships Node 18.19, below WebdriverIO 9's floor (^18.20 || ^20.13 || >=22).
+# Ubuntu's own Node is below WebdriverIO 9's floor (^18.20 || ^20.13 || >=22).
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -45,8 +45,6 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-
-RUN cargo install tauri-driver --locked
 
 WORKDIR /work
 

@@ -8,9 +8,9 @@ pub use connector::{
 };
 
 use super::auth::{Activity, ConnectorStatus, Interactive, Readiness, Stored};
-use super::connector_state::{ConnectorState, ToolPolicy};
+use super::connector_state::{Choice, ConnectorState, ToolPolicy};
 use super::error::{AuthError, ConnectError, ToolError};
-use super::exposure::{ApprovalReason, Exposure, Gate, Scope};
+use super::exposure::{ApprovalReason, Exposure, Gate, RequestUrl, Scope, ToolRisk};
 use super::hidden_text;
 use super::result_store::MAX_PREVIEW_BYTES;
 use crate::reporting::approval_failure;
@@ -67,6 +67,14 @@ impl Connector for ConnectorHandle {
 
     fn vetted(&self) -> bool {
         self.inner.vetted()
+    }
+
+    fn risk(&self, tool_name: &str) -> ToolRisk {
+        self.inner.risk(tool_name)
+    }
+
+    fn request_url(&self, tool_name: &str, input: &Value) -> Option<RequestUrl> {
+        self.inner.request_url(tool_name, input)
     }
 
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError> {
@@ -221,60 +229,34 @@ impl ToolRegistry {
             .contains(connector_id)
     }
 
-    /// Stores every choice explicitly, AutoApprove included: an absent entry means the tool's
-    /// declared default, which may be Ask.
     pub fn set_tool_policy(&self, connector_id: &str, tool_name: &str, policy: ToolPolicy) {
         let pin = (policy == ToolPolicy::AutoApprove)
             .then(|| self.pinnable(connector_id, tool_name))
             .flatten();
-        let mut state = self.state.write().expect("state lock poisoned");
-        state
-            .tool_policies
-            .entry(connector_id.to_string())
-            .or_default()
-            .insert(tool_name.to_string(), policy);
-        let pins = state
-            .approved_tools
-            .entry(connector_id.to_string())
-            .or_default();
-        match pin {
-            Some(fingerprint) => pins.insert(tool_name.to_string(), fingerprint),
-            None => pins.remove(tool_name),
-        };
-        if let Some(tools) = state.always_allowed.get_mut(connector_id) {
-            tools.remove(tool_name);
-        }
+        self.state
+            .write()
+            .expect("state lock poisoned")
+            .choose_policy(connector_id, tool_name, policy, pin);
     }
 
     /// Auto-approves the tool and lets it run even after the conversation has read untrusted
     /// content. Choosing any policy afterwards withdraws this.
     pub fn always_allow(&self, connector_id: &str, tool_name: &str) {
-        self.set_tool_policy(connector_id, tool_name, ToolPolicy::AutoApprove);
-        let pin = self.pinnable(connector_id, tool_name).unwrap_or_default();
+        let pin = self.pinnable(connector_id, tool_name);
         self.state
             .write()
             .expect("state lock poisoned")
-            .always_allowed
-            .entry(connector_id.to_string())
-            .or_default()
-            .insert(tool_name.to_string(), pin);
+            .always_allow(connector_id, tool_name, pin);
     }
 
     /// Whether [`always_allow`](Self::always_allow) holds: chosen, and the tool unchanged since.
     pub fn is_always_allowed(&self, connector_id: &str, tool_name: &str) -> bool {
-        let Some(pinned) = self
-            .state
+        self.state
             .read()
             .expect("state lock poisoned")
-            .always_allowed
-            .get(connector_id)
-            .and_then(|tools| tools.get(tool_name))
-            .cloned()
-        else {
-            return false;
-        };
-        self.pinnable(connector_id, tool_name)
-            .is_none_or(|current| current == pinned)
+            .is_always_allowed(connector_id, tool_name, || {
+                self.pinnable(connector_id, tool_name)
+            })
     }
 
     /// The fingerprint to pin an approval to: MCP tools only, whose servers can change them
@@ -308,54 +290,33 @@ impl ToolRegistry {
     }
 
     /// An auto-approval of an MCP tool counts only while the tool is as it was when the user
-    /// approved it. Approvals saved before pinning are pinned to the tool as first seen, and the
-    /// pin is saved at once: re-pinning on every launch would carry the approval over to
-    /// whatever the server says next.
+    /// approved it.
     fn saved_tool_policy(&self, connector_id: &str, tool_name: &str) -> Option<ToolPolicy> {
-        let (saved, pinned) = {
-            let state = self.state.read().expect("state lock poisoned");
-            let saved = state
-                .tool_policies
-                .get(connector_id)
-                .and_then(|tools| tools.get(tool_name))
-                .copied()?;
-            let pinned = state
-                .approved_tools
-                .get(connector_id)
-                .and_then(|tools| tools.get(tool_name))
-                .cloned();
-            (saved, pinned)
-        };
-        if saved != ToolPolicy::AutoApprove {
-            return Some(saved);
-        }
-        let Some(current) = self.pinnable(connector_id, tool_name) else {
-            return Some(saved);
-        };
-        match pinned {
-            Some(pinned) if pinned != current => None,
-            Some(_) => Some(saved),
-            None => {
+        let choice = self.state.read().expect("state lock poisoned").tool_choice(
+            connector_id,
+            tool_name,
+            || self.pinnable(connector_id, tool_name),
+        );
+        match choice {
+            Choice::Unset => None,
+            Choice::Stands(policy) => Some(policy),
+            Choice::Unpinned(policy, fingerprint) => {
                 let pinned = {
                     let mut state = self.state.write().expect("state lock poisoned");
-                    state
-                        .approved_tools
-                        .entry(connector_id.to_string())
-                        .or_default()
-                        .insert(tool_name.to_string(), current);
+                    state.pin_approval(connector_id, tool_name, fingerprint);
                     state.clone()
                 };
                 self.persist(&pinned);
-                Some(saved)
+                Some(policy)
             }
         }
     }
 
     pub fn clear_tool_policies(&self, connector_id: &str) {
-        let mut state = self.state.write().expect("state lock poisoned");
-        state.tool_policies.remove(connector_id);
-        state.approved_tools.remove(connector_id);
-        state.always_allowed.remove(connector_id);
+        self.state
+            .write()
+            .expect("state lock poisoned")
+            .forget_tool_choices(connector_id);
     }
 
     pub fn set_state(&self, state: ConnectorState) {
@@ -455,7 +416,7 @@ impl ToolRegistry {
             .unwrap_or_default()
     }
 
-    fn has_ever_succeeded(&self, connector_id: &str) -> bool {
+    pub(crate) fn has_ever_succeeded(&self, connector_id: &str) -> bool {
         self.state
             .read()
             .expect("state lock poisoned")
@@ -656,63 +617,17 @@ impl ToolRegistry {
             .get(connector_id)
             .ok_or_else(|| ToolError::UnknownConnector(connector_id.into()))?;
 
-        if read_only {
-            connector.check_read_only(tool_name)?;
-        }
-
-        if !self.is_connector_enabled(connector_id) {
-            return Err(ToolError::ConnectorDisabled);
-        }
-
-        if let Readiness::Blocked { reason } = connector.readiness() {
-            return Err(ToolError::NotReady(reason));
-        }
-
-        let policy = self.get_tool_policy(connector_id, tool_name);
-        if policy == ToolPolicy::Disable {
-            return Err(ToolError::ToolDisabled);
-        }
-        let tool = connector
-            .tools()
-            .into_iter()
-            .find(|tool| tool.name == tool_name);
-        let exposure = self
-            .exposure_of(exposure_scope)
-            .with_unvetted_tools(self.offers_unvetted_tools(context.offered));
-        let gate = self.exposure().gate(
-            connector_id,
+        let risk = connector.risk(tool_name);
+        self.authorize(
+            &connector,
             tool_name,
-            tool.as_ref(),
-            connector.vetted(),
             &input,
-            exposure_scope,
-            exposure,
-        );
-        let gate = if self.is_always_allowed(connector_id, tool_name) {
-            gate.always_allowed()
-        } else {
-            gate
-        };
-        let (needs_approval, reason) = match gate {
-            Gate::Refuse(why) => {
-                info!("refused {connector_id}.{tool_name}: {why}");
-                return Err(ToolError::AccessDenied(why.into()));
-            }
-            Gate::Ask(reason) => (true, Some(reason)),
-            Gate::Allow => (policy == ToolPolicy::Ask && !auto_approve, None),
-        };
-        if needs_approval {
-            match self
-                .request_approval(connector_id, tool_name, &input, reason.as_ref())
-                .await
-            {
-                ApprovalDecision::Deny => return Err(ToolError::ApprovalDenied),
-                ApprovalDecision::Once => {}
-                ApprovalDecision::Always => {
-                    self.remember_always(connector_id, tool_name, reason.as_ref())
-                }
-            }
-        }
+            risk,
+            auto_approve,
+            read_only,
+            context,
+        )
+        .await?;
 
         let scope = self.result_store.scope();
         let allow_file = connector_id == "filesystem"
@@ -720,25 +635,8 @@ impl ToolRegistry {
             && input.get("format").and_then(Value::as_str) == Some("file");
         let result = self
             .invoke_once_retrying(&connector, tool_name, input, read_only)
-            .await
-            .map_err(|error| error.bounded_for_model(MAX_PREVIEW_BYTES))
-            .map(|mut value| {
-                if matches!(connector_id, "proton_mail" | "browser")
-                    || connector_id.starts_with("mcp-")
-                {
-                    hidden_text::strip_smuggled(&mut value);
-                }
-                value
-            });
-        let exposed = self.exposure().record(
-            connector_id,
-            tool_name,
-            exposure_scope,
-            result.as_ref().ok(),
-        );
-        if let Scope::Conversation(id) = exposure_scope {
-            self.expose_conversation(id, exposed);
-        }
+            .await;
+        let result = self.sanitize_and_record(risk, exposure_scope, result);
         let has_remote = connector.as_credentialed().is_some() || connector.as_session().is_some();
         match &result {
             _ if !has_remote => {}
@@ -768,6 +666,105 @@ impl ToolRegistry {
             Ok(value) => self.result_store.preview(scope, connector_id, value),
             Err(error) => Err(error),
         }
+    }
+
+    /// Runs every check that can reject a call before it reaches the connector: schedule access,
+    /// connector and tool settings, the exposure gate and user approval.
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        connector: &ConnectorHandle,
+        tool_name: &str,
+        input: &Value,
+        risk: ToolRisk,
+        auto_approve: bool,
+        read_only: bool,
+        context: CallContext<'_>,
+    ) -> Result<(), ToolError> {
+        let connector_id = connector.id();
+        if read_only {
+            connector.check_read_only(tool_name)?;
+        }
+
+        if !self.is_connector_enabled(connector_id) {
+            return Err(ToolError::ConnectorDisabled);
+        }
+
+        if let Readiness::Blocked { reason } = connector.readiness() {
+            return Err(ToolError::NotReady(reason));
+        }
+
+        let policy = self.get_tool_policy(connector_id, tool_name);
+        if policy == ToolPolicy::Disable {
+            return Err(ToolError::ToolDisabled);
+        }
+        let scope = Scope::of(context.run, context.conversation);
+        let exposure = self
+            .exposure_of(scope)
+            .with_unvetted_tools(self.offers_unvetted_tools(context.offered));
+        let gate = self.exposure().gate(
+            risk,
+            connector.request_url(tool_name, input).as_ref(),
+            input,
+            scope,
+            exposure,
+        );
+        let gate = if self.is_always_allowed(connector_id, tool_name) {
+            gate.always_allowed()
+        } else {
+            gate
+        };
+        let (needs_approval, reason) = match gate {
+            Gate::Refuse(why) => {
+                info!("refused {connector_id}.{tool_name}: {why}");
+                return Err(ToolError::AccessDenied(why.into()));
+            }
+            Gate::Ask(reason) => (true, Some(reason)),
+            Gate::Allow => (policy == ToolPolicy::Ask && !auto_approve, None),
+        };
+        if needs_approval {
+            match self
+                .request_approval(
+                    connector_id,
+                    tool_name,
+                    input,
+                    reason.as_ref(),
+                    context.conversation,
+                )
+                .await
+            {
+                ApprovalDecision::Deny => return Err(ToolError::ApprovalDenied),
+                ApprovalDecision::Once => {}
+                ApprovalDecision::Always => {
+                    self.remember_always(connector_id, tool_name, reason.as_ref())
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applied to every result and error before it is stored or returned. Strips hidden text,
+    /// then records exposure. Failed calls are recorded as well, because an error can carry
+    /// remote text.
+    fn sanitize_and_record(
+        &self,
+        risk: ToolRisk,
+        scope: Scope,
+        result: Result<Value, ToolError>,
+    ) -> Result<Value, ToolError> {
+        let result = result
+            .map_err(|error| error.for_model(MAX_PREVIEW_BYTES))
+            .map(|mut value| {
+                hidden_text::strip_smuggled_value(&mut value);
+                value
+            });
+        let exposed = self
+            .exposure()
+            .record(risk.exposes, scope, result.as_ref().ok());
+        if let Scope::Conversation(id) = scope {
+            self.expose_conversation(id, exposed);
+        }
+        result
     }
 
     /// Re-establishes a session that turned out to be dead and retries the call once.
@@ -840,41 +837,19 @@ impl ToolRegistry {
                 .read()
                 .expect("state lock poisoned")
                 .exposed_conversations
-                .get(id)
-                .copied()
-                .unwrap_or_default(),
+                .exposure(id),
             other => self.exposure().exposure(other),
         }
     }
 
     /// Persists only when a conversation's exposure grows, which happens a few times at most.
     fn expose_conversation(&self, id: &str, exposed: Exposure) {
-        if exposed.is_empty() {
-            return;
-        }
         let changed = {
             let mut state = self.state.write().expect("state lock poisoned");
-            let conversations = &mut state.exposed_conversations;
-            let changed = match conversations.get_mut(id) {
-                Some(exposure) => exposure.merge(exposed),
-                None => {
-                    let seq = conversations.values().map(|e| e.seq).max().unwrap_or(0) + 1;
-                    if conversations.len() >= super::exposure::MAX_TRACKED_CONVERSATIONS {
-                        let oldest = conversations
-                            .iter()
-                            .min_by_key(|(_, exposure)| exposure.seq)
-                            .map(|(id, _)| id.clone());
-                        if let Some(oldest) = oldest {
-                            conversations.remove(&oldest);
-                        }
-                    }
-                    let mut first = exposed;
-                    first.seq = seq;
-                    conversations.insert(id.to_string(), first);
-                    true
-                }
-            };
-            changed.then(|| state.clone())
+            state
+                .exposed_conversations
+                .expose(id, exposed)
+                .then(|| state.clone())
         };
         if let Some(state) = changed {
             self.persist(&state);
@@ -907,6 +882,7 @@ impl ToolRegistry {
         tool_name: &str,
         input: &Value,
         reason: Option<&ApprovalReason>,
+        conversation: Option<&str>,
     ) -> ApprovalDecision {
         let gate = self
             .approval_gate
@@ -914,7 +890,10 @@ impl ToolRegistry {
             .expect("approval gate lock poisoned")
             .clone();
         match gate {
-            Some(gate) => gate.request(connector_id, tool_name, input, reason).await,
+            Some(gate) => {
+                gate.request(connector_id, tool_name, input, reason, conversation)
+                    .await
+            }
             None => {
                 approval_failure("Approval gate missing");
                 error!("no approval gate wired; denying 'ask' tool call");

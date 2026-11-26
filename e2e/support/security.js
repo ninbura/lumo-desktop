@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { assertNoStubError, runTool, textOf, waitForPendingCount, waitForResult, waitForStubReady } = require('./waits');
 
 const scratch = process.env.LUMO_E2E_SCRATCH;
-const configDir = path.join(process.env.XDG_CONFIG_HOME, 'me.proton.lumo-app');
+const configDir = process.env.LUMO_E2E_CONFIG_DIR;
 const mcpId = 'mcp-security';
 
 async function setPolicy(connector, tool, policy) {

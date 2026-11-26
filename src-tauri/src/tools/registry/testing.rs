@@ -1,5 +1,6 @@
 use super::*;
 use crate::tools::auth::AuthMechanism;
+use crate::tools::connectors::{bash, browser, filesystem, luminance, mcp, proton_mail};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -19,6 +20,35 @@ impl FakeState {
     pub fn dropped_session_count(&self) -> usize {
         self.dropped_sessions.load(Ordering::SeqCst)
     }
+}
+
+/// Classification of the built-in connector with this id, so that a fake registered under it is
+/// gated the same way.
+pub fn builtin_risk(
+    connector_id: &str,
+    tool_name: &str,
+    tool: Option<&ToolDefinition>,
+    vetted: bool,
+) -> ToolRisk {
+    match connector_id {
+        "proton_mail" => proton_mail::risk(tool_name),
+        "browser" => browser::risk(),
+        "bash" => bash::risk(),
+        "filesystem" => filesystem::risk(tool_name),
+        "luminance" => luminance::risk(tool.and_then(|tool| tool.read_only) == Some(true)),
+        id if id.starts_with("mcp-") => mcp::risk(tool, vetted),
+        _ => ToolRisk::default(),
+    }
+}
+
+pub fn builtin_request_url(
+    connector_id: &str,
+    tool_name: &str,
+    input: &Value,
+) -> Option<RequestUrl> {
+    (connector_id == "browser")
+        .then(|| browser::request_url(tool_name, input))
+        .flatten()
 }
 
 /// A connector whose capabilities and per-call outcomes are chosen by the test.
@@ -152,6 +182,16 @@ impl Connector for FakeConnector {
 
     fn vetted(&self) -> bool {
         self.vetted
+    }
+
+    fn risk(&self, tool_name: &str) -> ToolRisk {
+        let tools = self.tools();
+        let tool = tools.iter().find(|tool| tool.name == tool_name);
+        builtin_risk(&self.id, tool_name, tool, self.vetted)
+    }
+
+    fn request_url(&self, tool_name: &str, input: &Value) -> Option<RequestUrl> {
+        builtin_request_url(&self.id, tool_name, input)
     }
 
     async fn invoke(&self, _tool_name: &str, _input: Value) -> Result<Value, ToolError> {

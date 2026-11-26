@@ -1,0 +1,15 @@
+[package]
+name = "lumo-tools"
+version = "0.0.0"
+edition = "2021"
+description = "Runs the tools Lumo starts on macOS under their own privacy identity"
+license = "GPL-3.0-only"
+publish = false
+
+# Standalone crate: Tauri bundles every binary of the src-tauri package on all platforms.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+strip = true
+panic = "abort"

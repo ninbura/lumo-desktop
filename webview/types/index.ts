@@ -163,6 +163,8 @@ export type ToolApprovalRequestPayload = {
   tool_name?: string;
   input?: unknown;
   reason?: ToolApprovalReason | null;
+  /** The conversation the web app named on the tool call, if any. */
+  conversation_id?: string | null;
 };
 
 /** Why native asks: the conversation has read untrusted content and the call can send data out or change files. */
@@ -189,6 +191,7 @@ export type ToolCallOptions = {
 export type ToolApprovalResolvedPayload = {
   request_id?: string;
   approved?: boolean;
+  conversation_id?: string | null;
 };
 
 export type ScheduleToolContext = { connectionId: string; runId: string };

@@ -93,7 +93,9 @@ pub async fn set_desktop_feature_flags(
         }
     } else {
         for server_id in EXPERIMENTAL_CONNECTOR_PRESETS.iter() {
-            registry.retire(&format!("mcp-{server_id}")).await;
+            registry
+                .retire(&crate::tools::connectors::mcp::connector_id(server_id))
+                .await;
         }
     }
     crate::tools::emit_connectors_changed(&app_handle);

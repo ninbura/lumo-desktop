@@ -269,16 +269,274 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
     };
   }
 
+  /** Connectors whose tools go with every request, however many other tools are connected. */
+  const ALWAYS_LOADED_CONNECTORS = new Set(['browser', 'filesystem', 'bash', 'proton_mail']);
+  /**
+   * Once the other connectors' tools take more than this many characters of JSON (about 1k
+   * tokens, roughly what the catalog replacing them costs), they are left out of requests and
+   * the model finds them with `SEARCH_TOOL`.
+   */
+  const DEFERRAL_THRESHOLD_CHARS = 4_000;
+  /** Tool names listed in `SEARCH_TOOL`'s catalog, shared fairly between connectors. */
+  const CATALOG_NAME_BUDGET_CHARS = 4_000;
+  const CATALOG_SUMMARY_CHARS = 160;
+  const SEARCH_TOOL = 'tool_search__search_tools';
+  const CALL_TOOL = 'tool_search__call_tool';
+  const DEFAULT_SEARCH_LIMIT = 5;
+  const MAX_SEARCH_LIMIT = 10;
+
   let manifests: ConnectorManifest[] = [];
   let desktopFeatureFlags = { experimentalConnectors: false };
   let builtinTools: NamespacedTool[] = [];
   let nativeTools: NamespacedTool[] = [];
   let availableTools: NamespacedTool[] = [];
+  /** Searchable whether or not they are deferred right now, so a conversation that started with
+   *  search keeps working after a connector is removed and deferral switches off. */
+  let deferrableTools: NamespacedTool[] = [];
+  let deferredTools: NamespacedTool[] = [];
+  let advertisedTools: OpenAITool[] = [];
   let initPromise: Promise<void> | null = null;
 
   function refreshToolLists(): void {
     nativeTools = [...namespaceTools(manifests.filter((c) => c.enabled !== false)), ...builtinTools];
     availableTools = [...namespaceTools(manifests.filter(isConnectorReady)), ...builtinTools];
+    deferrableTools = availableTools.filter(
+      (t) => !ALWAYS_LOADED_CONNECTORS.has(t.connector_id) && !builtinTools.includes(t)
+    );
+    deferredTools =
+      isTauri() && JSON.stringify(toOpenAITools(deferrableTools)).length > DEFERRAL_THRESHOLD_CHARS
+        ? deferrableTools
+        : [];
+    const loaded = availableTools.filter((t) => !deferredTools.includes(t));
+    advertisedTools = [
+      ...toOpenAITools(loaded),
+      ...(deferredTools.length > 0 ? toolSearchTools(deferredTools) : []),
+    ];
+  }
+
+  function isToolSearchTool(name: string): boolean {
+    return isTauri() && (name === SEARCH_TOOL || name === CALL_TOOL);
+  }
+
+  function connectorSummary(id: string): string {
+    const preset = [...BUILTIN_CONNECTORS, ...getFeaturedMcpServers(true)].find((entry) => entry.id === id);
+    const summary = (manifests.find((m) => m.id === id)?.description || preset?.description || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return summary.length > CATALOG_SUMMARY_CHARS ? `${summary.slice(0, CATALOG_SUMMARY_CHARS - 1)}…` : summary;
+  }
+
+  type NameGroup = { prefix: string; rests: string[] };
+
+  /** Names sharing a leading word, such as `get_` or `create` in `createIssue`, are grouped. */
+  function groupByPrefix(names: string[]): NameGroup[] {
+    const groups = new Map<string, string[]>();
+    for (const name of names) {
+      const prefix = name.match(/^[a-z0-9]+(?:[_.-]|(?=[A-Z]))/)?.[0] ?? '';
+      groups.set(prefix, [...(groups.get(prefix) ?? []), name.slice(prefix.length)]);
+    }
+    return [...groups].flatMap(([prefix, rests]) =>
+      prefix && rests.length > 1
+        ? [{ prefix, rests }]
+        : rests.map((rest) => ({ prefix: '', rests: [prefix + rest] }))
+    );
+  }
+
+  function renderGroup({ prefix, rests }: NameGroup): string {
+    return rests.length > 1 ? `${prefix}{${rests.join(',')}}` : prefix + rests[0];
+  }
+
+  /** As many of `names` as fit in `budget` characters, grouped by prefix, and how many didn't. */
+  function compressNames(names: string[], budget: number): { text: string; omitted: number } {
+    const parts: string[] = [];
+    let used = 0;
+    let shown = 0;
+    for (const group of groupByPrefix(names)) {
+      const fit: string[] = [];
+      for (const rest of group.rests) {
+        const part = renderGroup({ prefix: group.prefix, rests: [...fit, rest] });
+        if (used + part.length + 2 > budget) break;
+        fit.push(rest);
+      }
+      if (fit.length === 0) break;
+      const part = renderGroup({ prefix: group.prefix, rests: fit });
+      parts.push(part);
+      used += part.length + 2;
+      shown += fit.length;
+      if (fit.length < group.rests.length) break;
+    }
+    return { text: parts.join(', '), omitted: names.length - shown };
+  }
+
+  /**
+   * One entry per connector: its name, a one-line summary and as many tool names as its share of
+   * the budget allows. Connectors needing less than an even share give the rest to the others.
+   */
+  function toolCatalog(deferred: NamespacedTool[]): string {
+    const names = new Map<string, string[]>();
+    for (const tool of deferred) {
+      names.set(tool.connector_id, [...(names.get(tool.connector_id) ?? []), tool.tool_name]);
+    }
+    const cost = (list: string[]) => compressNames(list, Infinity).text.length + 2;
+    const listed = new Map<string, { text: string; omitted: number }>();
+    let remaining = CATALOG_NAME_BUDGET_CHARS;
+    const bySize = [...names].sort(([, a], [, b]) => cost(a) - cost(b));
+    bySize.forEach(([id, list], i) => {
+      const compressed = compressNames(list, Math.floor(remaining / (bySize.length - i)));
+      listed.set(id, compressed);
+      remaining -= compressed.text.length + 2;
+    });
+    const entries = [...names].map(([id, list]) => {
+      const display = manifests.find((m) => m.id === id)?.display_name || id;
+      const summary = connectorSummary(id);
+      const { text, omitted } = listed.get(id) ?? { text: '', omitted: list.length };
+      const tools = text ? `${text}${omitted ? `, and ${omitted} more` : ''}` : `${list.length} tools`;
+      return `- ${display} (connector "${id}")${summary ? `: ${summary}` : ''}\n  Tools: ${tools}`;
+    });
+    return [
+      'Braces group names with a shared start: get_{matter,task} means get_matter and get_task.',
+      ...entries,
+    ].join('\n');
+  }
+
+  function toolSearchTools(deferred: NamespacedTool[]): OpenAITool[] {
+    return [
+      {
+        type: 'function',
+        function: {
+          name: SEARCH_TOOL,
+          description:
+            'Get the parameters of tools from the user\'s connected services, which are listed ' +
+            'below by name only to save space. Pass the names you need; search with a query only ' +
+            'for tools the list leaves out. Run a tool with ' +
+            `${CALL_TOOL}. Check here before saying a service can't do something.\n` +
+            toolCatalog(deferred),
+          parameters: normalizeParameters({
+            type: 'object',
+            properties: {
+              names: {
+                type: 'array',
+                items: { type: 'string' },
+                maxItems: MAX_SEARCH_LIMIT,
+                description: 'Exact tool names from the list, e.g. ["list_matters", "get_matter"].',
+              },
+              query: {
+                type: 'string',
+                description: 'Words describing the task, e.g. "create issue" or "list matters".',
+              },
+              connector: {
+                type: 'string',
+                description: 'Only search this connector. With an empty query, lists its tools.',
+              },
+              limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: MAX_SEARCH_LIMIT,
+                description: `How many tools to return (default ${DEFAULT_SEARCH_LIMIT}).`,
+              },
+            },
+          }),
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: CALL_TOOL,
+          description: `Run a tool whose parameters you got from ${SEARCH_TOOL}.`,
+          parameters: normalizeParameters({
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: `The tool's full name as ${SEARCH_TOOL} returned it.` },
+              arguments: { type: 'object', description: 'Arguments matching the tool\'s parameters.' },
+            },
+            required: ['name', 'arguments'],
+          }),
+        },
+      },
+    ];
+  }
+
+  function searchTerms(text: string): string[] {
+    return text
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean);
+  }
+
+  /** Name matches count most, then the connector, then the title and description. */
+  function searchScore(tool: NamespacedTool, terms: string[]): number {
+    const nameTerms = searchTerms(tool.tool_name);
+    const connector = `${tool.connector_id} ${manifests.find((m) => m.id === tool.connector_id)?.display_name ?? ''}`.toLowerCase();
+    const text = `${tool.title ?? ''} ${tool.description ?? ''}`.toLowerCase();
+    return terms.reduce((score, term) => {
+      if (nameTerms.includes(term)) return score + 4;
+      if (nameTerms.some((t) => t.startsWith(term) || term.startsWith(t))) return score + 2;
+      if (connector.includes(term)) return score + 2;
+      return text.includes(term) ? score + 1 : score;
+    }, 0);
+  }
+
+  function describeTool(tool: NamespacedTool) {
+    return {
+      name: tool.name,
+      description: tool.description || '',
+      parameters: tool.input_schema ?? { type: 'object', properties: {} },
+    };
+  }
+
+  /** A bare name matching tools on several connectors returns each of them. */
+  function lookUpTools(names: string[], connector: string | undefined): unknown {
+    const tools: NamespacedTool[] = [];
+    const notFound: string[] = [];
+    for (const name of names.slice(0, MAX_SEARCH_LIMIT)) {
+      const matched = deferrableTools.filter(
+        (tool) =>
+          tool.name === name || (tool.tool_name === name && (!connector || tool.connector_id === connector))
+      );
+      if (matched.length === 0) notFound.push(name);
+      tools.push(...matched.filter((tool) => !tools.includes(tool)));
+    }
+    const notes = [
+      ...(notFound.length ? [`Not found: ${notFound.join(', ')}. Search with a query instead.`] : []),
+      ...(names.length > MAX_SEARCH_LIMIT ? [`Only the first ${MAX_SEARCH_LIMIT} names were looked up.`] : []),
+    ];
+    return { tools: tools.map(describeTool), ...(notes.length ? { note: notes.join(' ') } : {}) };
+  }
+
+  function searchDeferredTools(input: Record<string, unknown>): unknown {
+    const query = typeof input.query === 'string' ? input.query.trim() : '';
+    const terms = searchTerms(query);
+    const connector = typeof input.connector === 'string' ? input.connector : undefined;
+    const names = Array.isArray(input.names)
+      ? input.names.filter((name): name is string => typeof name === 'string' && name.length > 0)
+      : [];
+    if (names.length > 0) {
+      return lookUpTools(names, connector);
+    }
+    const requested = typeof input.limit === 'number' ? Math.floor(input.limit) : DEFAULT_SEARCH_LIMIT;
+    const limit = Math.min(Math.max(requested || DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
+    const exact = (tool: NamespacedTool) => query === tool.tool_name || query === tool.name;
+    const matches = deferrableTools
+      .filter((tool) => !connector || tool.connector_id === connector)
+      .map((tool) => ({
+        tool,
+        score: exact(tool) ? Number.MAX_SAFE_INTEGER : terms.length ? searchScore(tool, terms) : 1,
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score);
+    const tools = matches.slice(0, limit).map(({ tool }) => describeTool(tool));
+    const note =
+      matches.length === 0
+        ? 'No tool matches. Try other words, or pass a connector with an empty query to list its tools.'
+        : matches.length > limit
+          ? `${matches.length - limit} more tools match; refine the query or raise the limit.`
+          : undefined;
+    return { tools, ...(note ? { note } : {}) };
+  }
+
+  function getAdvertisedTools(): OpenAITool[] {
+    return advertisedTools;
   }
 
   function emitToolsChanged(): void {
@@ -286,7 +544,7 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
       manifests,
       nativeTools,
       availableTools,
-      openaiTools: toOpenAITools(availableTools),
+      openaiTools: getAdvertisedTools(),
     };
     window.dispatchEvent(new CustomEvent('lumo:connectors-ready', { detail }));
     window.dispatchEvent(new CustomEvent('lumo:tools-changed', { detail }));
@@ -343,6 +601,14 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
       if (listen) {
         await listen('connector:changed', () => loadRegistry());
         await listen('connectors:changed', () => loadRegistry());
+        // The user added or removed a connector in Settings. The web app counts these in
+        // telemetry; it gets only the action and the kind, never which connector.
+        await listen('telemetry:connector', (event) => {
+          const { action, kind } = (event.payload || {}) as { action?: unknown; kind?: unknown };
+          if (action !== 'added' && action !== 'removed') return;
+          if (kind !== 'catalog' && kind !== 'mcp') return;
+          window.dispatchEvent(new CustomEvent(`lumo:connector-${action}`, { detail: { kind } }));
+        });
         await listen('tool:approval_request', (event) => {
           const p = (event.payload || {}) as ToolApprovalRequestPayload;
           window.dispatchEvent(
@@ -353,6 +619,7 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
                 toolName: p.tool_name,
                 input: p.input,
                 ...(p.reason ? { reason: p.reason } : {}),
+                ...(p.conversation_id ? { conversationId: p.conversation_id } : {}),
               },
             })
           );
@@ -364,6 +631,7 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
               detail: {
                 requestId: p.request_id,
                 approved: p.approved,
+                ...(p.conversation_id ? { conversationId: p.conversation_id } : {}),
               },
             })
           );
@@ -400,18 +668,25 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
     return manifests.filter((c) => c.readiness?.state === 'ready');
   }
 
-  /** OpenAI Chat Completions `tools` array for inference requests. */
+  /**
+   * OpenAI Chat Completions `tools` array for inference requests. When connected services have
+   * too many tools, theirs are replaced by `SEARCH_TOOL` and `CALL_TOOL`.
+   */
   function getOpenAITools(): OpenAITool[] {
-    return toOpenAITools(availableTools);
+    return getAdvertisedTools();
   }
 
   /** @deprecated Prefer getOpenAITools. */
   function getFlatApiTools(): FlatApiTool[] {
-    return toFlatApiTools(availableTools);
+    return getAdvertisedTools().map((tool) => ({
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters,
+    }));
   }
 
   function isNativeTool(name: string): boolean {
-    return nativeTools.some((t) => t.name === name);
+    return isToolSearchTool(name) || nativeTools.some((t) => t.name === name);
   }
 
   function isAvailableTool(name: string): boolean {
@@ -420,7 +695,7 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
       browser_navigate: 'browser__navigate',
     };
     const resolved = aliases[name] || name;
-    return availableTools.some((t) => t.name === resolved);
+    return isToolSearchTool(resolved) || availableTools.some((t) => t.name === resolved);
   }
 
   function parseNamespaced(name: string): { connectorId: string; toolName: string } {
@@ -565,6 +840,10 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
   async function executeToolCall(toolCall: ToolCall, scheduleContext?: ScheduleToolContext, options?: ToolCallOptions): Promise<ToolResultMessage> {
     const { id, name, arguments: args } = normalizeToolCall(toolCall);
 
+    if (isToolSearchTool(name)) {
+      return executeToolSearchCall(id, name, args, scheduleContext, options);
+    }
+
     if (!isAvailableTool(name)) {
       return {
         role: 'tool',
@@ -600,6 +879,40 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
         is_error: true,
       };
     }
+  }
+
+  /**
+   * Searching runs here; a call is unwrapped into the tool it names, so native sees that tool and
+   * applies its policy, approvals and schedule restrictions as it would to a direct call.
+   */
+  async function executeToolSearchCall(
+    id: string | null,
+    name: string,
+    args: Record<string, unknown>,
+    scheduleContext?: ScheduleToolContext,
+    options?: ToolCallOptions
+  ): Promise<ToolResultMessage> {
+    if (name === SEARCH_TOOL) {
+      return { role: 'tool', tool_call_id: id, name, content: serializeToolResult(searchDeferredTools(args)) };
+    }
+    const requested = typeof args.name === 'string' ? args.name : '';
+    const sameName = deferrableTools.filter((tool) => tool.tool_name === requested);
+    const target = !isAvailableTool(requested) && sameName.length === 1 ? sameName[0]!.name : requested;
+    if (!target || target === SEARCH_TOOL || target === CALL_TOOL) {
+      return {
+        role: 'tool',
+        tool_call_id: id,
+        name,
+        content: serializeToolResult({ error: `Pass the name of a tool returned by ${SEARCH_TOOL}.` }),
+        is_error: true,
+      };
+    }
+    const result = await executeToolCall(
+      { id, function: { name: target, arguments: args.arguments ?? {} } },
+      scheduleContext,
+      options
+    );
+    return { ...result, name };
   }
 
   /** Execute multiple tool calls (e.g. from one assistant turn). Runs in parallel. */
@@ -773,7 +1086,7 @@ const connectorIcons = typeof __LUMO_CONNECTOR_ICONS__ === 'undefined' ? {} : __
     disconnectConnector,
     openSettings,
     getCatalog,
-    ...(isTauri() && navigator.userAgent.includes('Mac OS X') ? { exportPdf } : {}),
+    ...(isTauri() ? { exportPdf } : {}),
     isDesktop: isTauri(),
     isBrowser: !isTauri(),
   };

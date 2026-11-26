@@ -30,7 +30,7 @@ impl ConfigFile for StoredConfig {
 #[test]
 fn mail_read_only_access_excludes_sending() {
     let tools = connector(None, None).tools();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 5);
     for tool in tools {
         assert_eq!(tool.read_only, Some(tool.name != "send_email"));
     }

@@ -1,6 +1,6 @@
 {
   "name": "lumo-desktop",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "private": true,
   "license": "GPL-3.0-only",
   "scripts": {
@@ -9,10 +9,11 @@
     "dev": "tauri dev",
     "build:webview": "node scripts/build-webview.mjs",
     "icons:desktop": "node scripts/build-desktop-icons.mjs",
-    "typecheck": "tsc --noEmit -p webview"
+    "typecheck": "tsc --noEmit -p webview",
+    "test:e2e": "node e2e/run-native.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "^2.12.5",
     "esbuild": "^0.28.1",
     "react": "^18.3.1",
     "semver": "^7.8.5",

@@ -2,7 +2,9 @@
 
 use anyhow::anyhow;
 use log::warn;
-use tauri::{AppHandle, Manager, Monitor, PhysicalPosition, Runtime, State, WebviewWindow, Window};
+use tauri::{
+    AppHandle, Manager, Monitor, PhysicalPosition, Runtime, State, Webview, WebviewWindow, Window,
+};
 
 use super::PendingQuickAsk;
 use crate::{main_window, updater};
@@ -83,6 +85,15 @@ pub fn show<R: Runtime>(app_handle: &AppHandle<R>) -> tauri::Result<WebviewWindo
             window.unminimize()?;
             // The page empties its field before hiding, so there is nothing to clear here.
             window.set_focus()?;
+            // On Windows, focusing the native window does not focus WebView2: the page gets no
+            // `focus` event, keeps its pill stowed, and the window sits invisible holding focus.
+            // Focus the webview itself and tell the page it is shown.
+            if let Err(e) = AsRef::<Webview<R>>::as_ref(&window).set_focus() {
+                warn!("could not focus the quick-ask webview: {e}");
+            }
+            if let Err(e) = window.eval("window.__lumoRevealSearch?.()") {
+                warn!("could not reveal the quick-ask field: {e}");
+            }
 
             window
         }

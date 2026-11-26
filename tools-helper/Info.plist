@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>me.proton.lumo-app.tools</string>
+	<key>CFBundleName</key>
+	<string>Lumo Tools</string>
+	<key>CFBundleDisplayName</key>
+	<string>Lumo Tools</string>
+	<key>CFBundleExecutable</key>
+	<string>lumo-tools</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Commands and connectors you run from Lumo need access to files in your Desktop folder.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Commands and connectors you run from Lumo need access to files in your Documents folder.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Commands and connectors you run from Lumo need access to files in your Downloads folder.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Commands and connectors you run from Lumo need access to files on a removable volume.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Commands and connectors you run from Lumo need access to files on a network volume.</string>
+</dict>
+</plist>

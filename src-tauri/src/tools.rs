@@ -1,6 +1,6 @@
 pub mod approvals;
 pub mod auth;
-mod child_process;
+pub(crate) mod child_process;
 pub mod command_path;
 pub mod commands;
 pub mod connector_state;
@@ -11,6 +11,7 @@ mod hidden_text;
 pub mod icons;
 mod keychain;
 pub mod oauth;
+mod path_guard;
 pub mod registry;
 pub mod result_reader;
 pub mod result_store;
@@ -178,6 +179,41 @@ impl RegistryHost for AccountStateFile {
 /// says the set of connectors or their shared state moved.
 pub fn emit_connector_changed(app_handle: &AppHandle, connector_id: &str) {
     let _ = app_handle.emit("connector:changed", connector_id.to_string());
+}
+
+/// Prefix of the registry id of every custom MCP server (`mcp-<server id>`).
+pub const MCP_CONNECTOR_PREFIX: &str = "mcp-";
+
+/// Tauri event the main window's connectors bridge turns into the web app's
+/// `lumo:connector-added` / `lumo:connector-removed` DOM events, which Lumo counts in telemetry.
+pub const CONNECTOR_LIFECYCLE_EVENT: &str = "telemetry:connector";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorLifecycle {
+    Added,
+    Removed,
+}
+
+/// 'catalog': any connector from the Settings catalog, built in (Proton Mail, Luminance) or a
+/// featured MCP server (Slack, Google Drive, …); 'mcp': a custom MCP server the user defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectorKind {
+    Catalog,
+    Mcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ConnectorLifecycleChange {
+    pub action: ConnectorLifecycle,
+    pub kind: ConnectorKind,
+}
+
+/// Reports that the user added or removed a connector. Carries only the action and the kind,
+/// never the connector's id, name or configuration.
+pub fn emit_connector_lifecycle(app_handle: &AppHandle, change: ConnectorLifecycleChange) {
+    let _ = app_handle.emit(CONNECTOR_LIFECYCLE_EVENT, change);
 }
 
 pub fn emit_connectors_changed(app_handle: &AppHandle) {

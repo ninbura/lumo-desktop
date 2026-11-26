@@ -1,5 +1,6 @@
 use log::{error, info, warn};
 use tauri::Manager;
+#[cfg(not(feature = "e2e-webdriver"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -12,9 +13,36 @@ use crate::{
 };
 
 pub fn run() {
+    tools::child_process::prepare_tool_processes();
     // The guard must outlive the event loop to prevent premature client shutdown.
     let _sentry = reporting::init();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be registered before any other plugin: it intercepts a second launch and
+    // forwards its arguments to the running instance, which is how Linux and Windows
+    // deliver deep links. A test binary must never forward its launch to an ordinary
+    // running Lumo, so the e2e-webdriver build leaves it out.
+    #[cfg(not(feature = "e2e-webdriver"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        if let Err(e) = main_window::show(app) {
+            warn!("failed to show main window on second launch: {e}");
+        }
+    }));
+    let builder = builder.plugin(
+        tauri_plugin_log::Builder::new()
+            .max_file_size(5_000_000)
+            .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+            .level(if cfg!(debug_assertions) {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Info
+            })
+            .build(),
+    );
+    #[cfg(feature = "e2e-webdriver")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio_webdriver::init())
+        .plugin(tauri_plugin_wdio::init());
+    builder
         .invoke_handler(|invoke| {
             let app = invoke.message.webview().app_handle().clone();
             if updater::is_required(&app) {
@@ -73,30 +101,24 @@ pub fn run() {
             ];
             commands(invoke)
         })
-        // Must be registered before any other plugin: it intercepts a second launch and
-        // forwards its arguments to the running instance, which is how Linux and Windows
-        // deliver deep links.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Err(e) = main_window::show(app) {
-                warn!("failed to show main window on second launch: {e}");
-            }
-        }))
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .max_file_size(5_000_000)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
-                .level(if cfg!(debug_assertions) {
-                    log::LevelFilter::Debug
-                } else {
-                    log::LevelFilter::Info
-                })
-                .build(),
-        )
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            #[cfg(feature = "e2e-webdriver")]
+            {
+                // Fail closed before reading or mutating any real application state.
+                if !crate::e2e_testing_enabled() {
+                    return Err("e2e-webdriver builds require LUMO_E2E_TESTING".into());
+                }
+                let config = std::env::var_os("LUMO_E2E_CONFIG_DIR")
+                    .ok_or("e2e-webdriver builds require LUMO_E2E_CONFIG_DIR")?;
+                if !std::path::Path::new(&config).is_absolute() {
+                    return Err("LUMO_E2E_CONFIG_DIR must be absolute".into());
+                }
+                app.add_capability(include_str!("../../e2e/automation-capability.json"))?;
+            }
             app.manage(updater::UpdateState::default());
             app.manage(downloads::Downloads::default());
             // First line of every launch: the log appends across sessions, and a bug report is
@@ -108,6 +130,10 @@ pub fn run() {
                 std::env::consts::ARCH,
                 if cfg!(debug_assertions) { "debug" } else { "release" }
             );
+
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                tools::child_process::install_tool_helper(&data_dir);
+            }
 
             if let Err(message) = reset::apply_pending_reset(app.handle()) {
                 error!("local configuration reset failed: {message}");
@@ -196,30 +222,40 @@ pub fn run() {
                 settings::DeviceSettings::default()
             });
 
-            app.handle()
-                .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))?;
-            let autostart_manager = app.autolaunch();
-            if settings.launch_at_startup {
-                let _ = autostart_manager.enable();
-            } else {
-                let _ = autostart_manager.disable();
+            // A test binary must never register itself as a login item.
+            #[cfg(not(feature = "e2e-webdriver"))]
+            {
+                app.handle()
+                    .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))?;
+                let autostart_manager = app.autolaunch();
+                if settings.launch_at_startup {
+                    let _ = autostart_manager.enable();
+                } else {
+                    let _ = autostart_manager.disable();
+                }
             }
 
             app.add_capability(main_window::web_app_capability(crate::LUMO_URL)?)?;
             main_window::build(app)?;
 
             let app_handle = app.handle().clone();
-            app.handle().plugin(
-                tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(move |_app, _shortcut, event| {
-                        if event.state() == ShortcutState::Pressed {
-                            if let Err(e) = quick_ask::window::show(&app_handle) {
-                                error!("could not show search window: {e}");
+            // The plugin's setup fails when the platform has no global hotkey backend (e.g. Linux
+            // without an X display). Run without the quick-ask shortcut rather than not at all.
+            let global_shortcuts = app
+                .handle()
+                .plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |_app, _shortcut, event| {
+                            if event.state() == ShortcutState::Pressed {
+                                if let Err(e) = quick_ask::window::show(&app_handle) {
+                                    error!("could not show search window: {e}");
+                                }
                             }
-                        }
-                    })
-                    .build(),
-            )?;
+                        })
+                        .build(),
+                )
+                .inspect_err(|e| error!("global shortcuts unavailable: {e}"))
+                .is_ok();
 
             #[cfg(target_os = "macos")]
             {
@@ -227,12 +263,16 @@ pub fn run() {
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
             }
 
-            if settings.search_shortcut_enabled {
+            if global_shortcuts && settings.search_shortcut_enabled {
                 let shortcut = settings
                     .search_shortcut
                     .parse::<Shortcut>()
                     .unwrap_or_else(|_| Shortcut::new(Some(Modifiers::CONTROL), Code::KeyL));
-                app.handle().global_shortcut().register(shortcut)?;
+                // Another app may already own the shortcut, or the platform may not support global
+                // shortcuts (e.g. Wayland). Lumo is still usable without it, so never abort setup.
+                if let Err(e) = app.handle().global_shortcut().register(shortcut) {
+                    error!("could not register the quick-ask shortcut {shortcut}: {e}");
+                }
             }
             tray::create(app.handle())?;
             updater::startup(app.handle());

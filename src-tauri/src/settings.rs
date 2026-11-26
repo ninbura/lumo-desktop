@@ -6,7 +6,9 @@ use crate::account::AccountId;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(feature = "e2e-webdriver"))]
+use tauri::Manager;
 
 pub const KEYCHAIN_SERVICE: &str = "me.proton.lumo-app";
 
@@ -152,6 +154,15 @@ pub fn save_account_settings(
     write_json(account_settings_path(app_handle, account)?, settings)
 }
 
+#[cfg(feature = "e2e-webdriver")]
+pub fn get_config_dir(_app_handle: &AppHandle) -> Result<PathBuf, String> {
+    std::env::var_os("LUMO_E2E_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .ok_or_else(|| "e2e-webdriver builds require an absolute LUMO_E2E_CONFIG_DIR".into())
+}
+
+#[cfg(not(feature = "e2e-webdriver"))]
 pub fn get_config_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
     app_handle
         .path()

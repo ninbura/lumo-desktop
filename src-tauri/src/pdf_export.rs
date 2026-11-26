@@ -4,9 +4,6 @@
 //! `print()` does nothing in the desktop webview. Instead the web app hands the document's HTML
 //! to `export_pdf`, which asks where to save it and renders it with the OS print engine: real,
 //! selectable text and page breaks driven by the document's print CSS, like a browser's PDF.
-//!
-//! macOS only for now. Elsewhere the bridge does not expose `exportPdf`, so the web app keeps its
-//! image-page PDF fallback.
 
 use serde::Serialize;
 use tauri::{Manager, State, Webview};
@@ -14,7 +11,7 @@ use tauri::{Manager, State, Webview};
 use crate::downloads::{self, Downloads};
 
 /// Generous on purpose: a long document with images can take a while to lay out and paginate.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 const RENDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Upper bound on the HTML accepted over IPC. Assumption: artifact documents, images inlined as
@@ -57,7 +54,7 @@ pub async fn export_pdf(
     }
     let file_name = pdf_file_name(&file_name);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     {
         let Some(path) = pick_destination(&webview, &file_name).await? else {
             return Ok(PdfExportResult::of(PdfExportStatus::Cancelled));
@@ -82,45 +79,35 @@ pub async fn export_pdf(
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         let _ = (downloads, html, title, file_name);
         Err("PDF export is not supported on this platform yet".into())
     }
 }
 
+/// Blocks every network and file load, whatever the document's markup; `data:` and
+/// `about:` stay allowed. Complements the CSP in case the meta tag lands somewhere ignored.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const BLOCK_NETWORK_RULES: &str = r#"[
+    {"trigger": {"url-filter": "^https?:"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "^wss?:"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "^ftp:"}, "action": {"type": "block"}},
+    {"trigger": {"url-filter": "^file:"}, "action": {"type": "block"}}
+]"#;
+
 /// The hosted artifact view loads nothing remote, so neither may the export of the same document.
 const EXPORT_CSP: &str =
     "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:";
 
-/// `html` with [`EXPORT_CSP`] as the first element of its head.
+/// `html` with [`EXPORT_CSP`] directly after its doctype.
 ///
-/// A CSP meta tag is ignored in the body and a tag before the doctype switches to quirks mode,
-/// so it goes inside an explicit `<head>` that precedes `<body>`, else after the doctype.
+/// The parser places a meta tag at that position in the head whatever markup follows. A tag
+/// before the doctype switches to quirks mode.
 fn with_csp(html: &str) -> String {
     let meta = format!(r#"<meta http-equiv="Content-Security-Policy" content="{EXPORT_CSP}">"#);
-    let at = head_content_start(html)
-        .or_else(|| doctype_end(html))
-        .unwrap_or(0);
+    let at = doctype_end(html).unwrap_or(0);
     format!("{}{meta}{}", &html[..at], &html[at..])
-}
-
-fn head_content_start(html: &str) -> Option<usize> {
-    // ASCII lowercasing keeps byte offsets, so they index `html` too.
-    let lower = html.to_ascii_lowercase();
-    let body = lower.find("<body").unwrap_or(lower.len());
-    let mut from = 0;
-    while let Some(found) = lower[from..body].find("<head") {
-        let after = from + found + "<head".len();
-        match lower.as_bytes().get(after) {
-            Some(b'>') => return Some(after + 1),
-            Some(c) if c.is_ascii_whitespace() => {
-                return lower[after..].find('>').map(|end| after + end + 1);
-            }
-            _ => from = after,
-        }
-    }
-    None
 }
 
 fn doctype_end(html: &str) -> Option<usize> {
@@ -153,7 +140,7 @@ fn pdf_file_name(requested: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 async fn pick_destination(
     webview: &Webview,
     file_name: &str,
@@ -198,6 +185,520 @@ async fn render(
     }
 }
 
+#[cfg(windows)]
+async fn render(
+    webview: &Webview,
+    html: String,
+    _title: String,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let page = webview2::write_page(&html)?;
+    let url = url::Url::from_file_path(&page)
+        .map_err(|_| "Could not prepare the PDF renderer".to_string())?
+        .to_string();
+    let (done, result) = tokio::sync::oneshot::channel();
+    let rendered = webview
+        .with_webview(move |platform| {
+            webview2::print_to_pdf(
+                platform.controller(),
+                platform.environment(),
+                url,
+                path,
+                done,
+            )
+        })
+        .map_err(|e| e.to_string());
+    let outcome = match rendered {
+        Ok(()) => match tokio::time::timeout(RENDER_TIMEOUT, result).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err("PDF renderer stopped without a result".into()),
+            Err(_) => Err("PDF rendering timed out".into()),
+        },
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&page);
+    outcome
+}
+
+#[cfg(windows)]
+mod webview2 {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    use webview2_com::{
+        take_pwstr, CreateCoreWebView2ControllerCompletedHandler, NavigationCompletedEventHandler,
+        NavigationStartingEventHandler, PrintToPdfCompletedHandler,
+        WebResourceRequestedEventHandler,
+    };
+    use windows_core::{Interface, BOOL, HSTRING, PWSTR};
+
+    type Done = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+    /// Page margins in inches, matching the documents' `@page { margin: 18mm 16mm }`.
+    const MARGIN_VERTICAL: f64 = 18.0 / 25.4;
+    const MARGIN_HORIZONTAL: f64 = 16.0 / 25.4;
+
+    /// `file:` is blocked separately because the document itself is a file.
+    const BLOCKED_SCHEMES: [&str; 5] = ["http:", "https:", "ws:", "wss:", "ftp:"];
+
+    struct Job {
+        controller: Option<ICoreWebView2Controller>,
+        path: PathBuf,
+        navigated: bool,
+        started: bool,
+        done: Option<Done>,
+    }
+
+    type SharedJob = Rc<RefCell<Job>>;
+
+    /// A file is used because `NavigateToString` limits HTML to 2 MB. The BOM fixes the encoding.
+    pub(super) fn write_page(html: &str) -> Result<PathBuf, String> {
+        let page =
+            std::env::temp_dir().join(format!("lumo-pdf-export-{}.html", uuid::Uuid::new_v4()));
+        std::fs::write(&page, format!("\u{FEFF}{}", super::with_csp(html)))
+            .map_err(|e| format!("Could not prepare the PDF renderer: {e}"))?;
+        Ok(page)
+    }
+
+    fn finish(job: &SharedJob, outcome: Result<(), String>) {
+        let (controller, done) = {
+            let mut job = job.borrow_mut();
+            (job.controller.take(), job.done.take())
+        };
+        if let Some(controller) = controller {
+            let _ = unsafe { controller.Close() };
+        }
+        if let Some(done) = done {
+            let _ = done.send(outcome);
+        }
+    }
+
+    /// Must run on the main thread.
+    pub(super) fn print_to_pdf(
+        main: ICoreWebView2Controller,
+        environment: ICoreWebView2Environment,
+        url: String,
+        path: PathBuf,
+        done: Done,
+    ) {
+        let job = Rc::new(RefCell::new(Job {
+            controller: None,
+            path,
+            navigated: false,
+            started: false,
+            done: Some(done),
+        }));
+        if let Err(error) = unsafe { create(&main, environment, url, &job) } {
+            finish(&job, Err(error.message()));
+        }
+    }
+
+    unsafe fn create(
+        main: &ICoreWebView2Controller,
+        environment: ICoreWebView2Environment,
+        url: String,
+        job: &SharedJob,
+    ) -> windows_core::Result<()> {
+        let mut parent = Default::default();
+        main.ParentWindow(&mut parent)?;
+
+        let created = {
+            let main = main.clone();
+            let environment = environment.clone();
+            let job = job.clone();
+            CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+                move |result, controller| {
+                    let loaded = match (result, controller) {
+                        (Ok(()), Some(controller)) => unsafe {
+                            load(&main, &environment, controller, &url, &job)
+                                .map_err(|e| e.message())
+                        },
+                        (Err(error), _) => Err(error.message()),
+                        (Ok(()), None) => Err("Could not create the PDF renderer".into()),
+                    };
+                    if let Err(error) = loaded {
+                        finish(&job, Err(error));
+                    }
+                    Ok(())
+                },
+            ))
+        };
+        environment.CreateCoreWebView2Controller(parent, &created)
+    }
+
+    unsafe fn load(
+        main: &ICoreWebView2Controller,
+        environment: &ICoreWebView2Environment,
+        controller: ICoreWebView2Controller,
+        url: &str,
+        job: &SharedJob,
+    ) -> windows_core::Result<()> {
+        job.borrow_mut().controller = Some(controller.clone());
+        controller.SetIsVisible(false)?;
+        let mut bounds = Default::default();
+        main.Bounds(&mut bounds)?;
+        controller.SetBounds(bounds)?;
+
+        let webview = controller.CoreWebView2()?;
+        let settings = webview.Settings()?;
+        settings.SetIsScriptEnabled(false)?;
+        settings.SetIsWebMessageEnabled(false)?;
+        settings.SetAreHostObjectsAllowed(false)?;
+        settings.SetAreDefaultScriptDialogsEnabled(false)?;
+
+        let mut token = 0i64;
+        webview.AddWebResourceRequestedFilter(
+            &HSTRING::from("*"),
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        )?;
+        let blocker = {
+            let environment = environment.clone();
+            WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                unsafe {
+                    let mut uri = PWSTR::null();
+                    args.Request()?.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri).to_ascii_lowercase();
+                    let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+                    args.ResourceContext(&mut context)?;
+                    // Frame navigations are cancelled, so the only document is the page itself.
+                    let subresource = context != COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT;
+                    if BLOCKED_SCHEMES.iter().any(|scheme| uri.starts_with(scheme))
+                        || (subresource && uri.starts_with("file:"))
+                    {
+                        let response = environment.CreateWebResourceResponse(
+                            None,
+                            403,
+                            &HSTRING::from("Blocked"),
+                            &HSTRING::new(),
+                        )?;
+                        args.SetResponse(&response)?;
+                    }
+                }
+                Ok(())
+            }))
+        };
+        webview.add_WebResourceRequested(&blocker, &mut token)?;
+
+        let gate = {
+            let job = job.clone();
+            NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut job = job.borrow_mut();
+                if job.navigated {
+                    unsafe { args.SetCancel(true)? };
+                } else {
+                    job.navigated = true;
+                }
+                Ok(())
+            }))
+        };
+        webview.add_NavigationStarting(&gate, &mut token)?;
+        let no_frames = NavigationStartingEventHandler::create(Box::new(|_, args| {
+            if let Some(args) = args {
+                unsafe { args.SetCancel(true)? };
+            }
+            Ok(())
+        }));
+        webview.add_FrameNavigationStarting(&no_frames, &mut token)?;
+
+        let loaded = {
+            let environment = environment.clone();
+            let webview = webview.clone();
+            let job = job.clone();
+            NavigationCompletedEventHandler::create(Box::new(move |_, args| {
+                {
+                    let mut job = job.borrow_mut();
+                    // Cancelled navigations also raise `NavigationCompleted`.
+                    if job.started || job.done.is_none() {
+                        return Ok(());
+                    }
+                    job.started = true;
+                }
+                let mut success = BOOL::default();
+                if let Some(args) = args {
+                    unsafe { args.IsSuccess(&mut success)? };
+                }
+                let printed = if success.as_bool() {
+                    unsafe { print(&environment, &webview, &job) }.map_err(|e| e.message())
+                } else {
+                    Err("The document could not be loaded".into())
+                };
+                if let Err(error) = printed {
+                    finish(&job, Err(error));
+                }
+                Ok(())
+            }))
+        };
+        webview.add_NavigationCompleted(&loaded, &mut token)?;
+
+        webview.Navigate(&HSTRING::from(url))
+    }
+
+    unsafe fn print(
+        environment: &ICoreWebView2Environment,
+        webview: &ICoreWebView2,
+        job: &SharedJob,
+    ) -> windows_core::Result<()> {
+        let webview = webview.cast::<ICoreWebView2_7>()?;
+        let settings = environment
+            .cast::<ICoreWebView2Environment6>()?
+            .CreatePrintSettings()?;
+        settings.SetMarginTop(MARGIN_VERTICAL)?;
+        settings.SetMarginBottom(MARGIN_VERTICAL)?;
+        settings.SetMarginLeft(MARGIN_HORIZONTAL)?;
+        settings.SetMarginRight(MARGIN_HORIZONTAL)?;
+
+        let path = HSTRING::from(job.borrow().path.as_os_str());
+        let completed = {
+            let job = job.clone();
+            PrintToPdfCompletedHandler::create(Box::new(move |result, printed| {
+                let outcome = match result {
+                    Ok(()) if printed => Ok(()),
+                    Ok(()) => Err("The print operation did not complete".into()),
+                    Err(error) => Err(error.message()),
+                };
+                finish(&job, outcome);
+                Ok(())
+            }))
+        };
+        webview.PrintToPdf(&path, &settings, &completed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn render(
+    webview: &Webview,
+    html: String,
+    _title: String,
+    path: std::path::PathBuf,
+) -> Result<(), String> {
+    let filters = webview
+        .app_handle()
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("content-filters");
+    std::fs::create_dir_all(&filters).map_err(|e| e.to_string())?;
+    let (done, result) = tokio::sync::oneshot::channel();
+    webview
+        .run_on_main_thread(move || webkitgtk::print_to_pdf(html, path, filters, done))
+        .map_err(|e| e.to_string())?;
+    match tokio::time::timeout(RENDER_TIMEOUT, result).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => Err("PDF renderer stopped without a result".into()),
+        Err(_) => Err("PDF rendering timed out".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod webkitgtk {
+    use std::cell::RefCell;
+    use std::ffi::CString;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    use gtk::prelude::*;
+    use webkit2gtk::glib::translate::{FromGlibPtrFull, ToGlibPtr};
+    use webkit2gtk::{
+        ffi, gio, glib, LoadEvent, PolicyDecisionExt, PolicyDecisionType, PrintOperation,
+        PrintOperationExt, SettingsExt, UserContentManager, WebView, WebViewExt,
+    };
+
+    type Done = tokio::sync::oneshot::Sender<Result<(), String>>;
+    type Compiled = Box<dyn FnOnce(Result<UserContentManager, String>)>;
+
+    /// Page margins matching the documents' `@page { margin: 18mm 16mm }`.
+    const MARGIN_VERTICAL_MM: f64 = 18.0;
+    const MARGIN_HORIZONTAL_MM: f64 = 16.0;
+
+    struct Job {
+        view: Option<WebView>,
+        operation: Option<PrintOperation>,
+        navigated: bool,
+        started: bool,
+        error: Option<String>,
+        done: Option<Done>,
+    }
+
+    type SharedJob = Rc<RefCell<Job>>;
+
+    fn finish(job: &SharedJob, outcome: Result<(), String>) {
+        let (view, done) = {
+            let mut job = job.borrow_mut();
+            job.operation = None;
+            (job.view.take(), job.done.take())
+        };
+        if let Some(done) = done {
+            let _ = done.send(outcome);
+        }
+        if let Some(view) = view {
+            // Deferred because `finish` can run inside a signal of the view being destroyed.
+            glib::idle_add_local_once(move || unsafe { view.destroy() });
+        }
+    }
+
+    fn start(job: &SharedJob) -> bool {
+        let mut job = job.borrow_mut();
+        !std::mem::replace(&mut job.started, true)
+    }
+
+    /// Must run on the main thread.
+    pub(super) fn print_to_pdf(html: String, path: PathBuf, filters: PathBuf, done: Done) {
+        let job = Rc::new(RefCell::new(Job {
+            view: None,
+            operation: None,
+            navigated: false,
+            started: false,
+            error: None,
+            done: Some(done),
+        }));
+        let html = super::with_csp(&html);
+        compile_filter(
+            &filters,
+            Box::new(move |manager| match manager {
+                Ok(manager) => load(&manager, &html, path, &job),
+                Err(error) => finish(&job, Err(error)),
+            }),
+        );
+    }
+
+    /// The Rust bindings do not wrap `WebKitUserContentFilterStore`, so it is called directly.
+    fn compile_filter(storage: &Path, then: Compiled) {
+        unsafe extern "C" fn saved(
+            store: *mut glib::gobject_ffi::GObject,
+            result: *mut gio::ffi::GAsyncResult,
+            data: glib::ffi::gpointer,
+        ) {
+            let then = unsafe { Box::from_raw(data as *mut Compiled) };
+            let mut error = std::ptr::null_mut();
+            let filter = unsafe {
+                ffi::webkit_user_content_filter_store_save_finish(
+                    store as *mut _,
+                    result,
+                    &mut error,
+                )
+            };
+            if filter.is_null() {
+                let message = if error.is_null() {
+                    "Could not prepare the PDF renderer".to_string()
+                } else {
+                    unsafe { glib::Error::from_glib_full(error) }.to_string()
+                };
+                then(Err(message));
+                return;
+            }
+            let manager = UserContentManager::new();
+            unsafe {
+                ffi::webkit_user_content_manager_add_filter(manager.to_glib_none().0, filter);
+                ffi::webkit_user_content_filter_unref(filter);
+            }
+            then(Ok(manager));
+        }
+
+        let (Ok(storage), Ok(identifier)) = (
+            CString::new(storage.to_string_lossy().into_owned()),
+            CString::new("LumoPdfExportBlockNetwork"),
+        ) else {
+            then(Err("Could not prepare the PDF renderer".into()));
+            return;
+        };
+        let rules = glib::Bytes::from_static(super::BLOCK_NETWORK_RULES.as_bytes());
+        unsafe {
+            let store = ffi::webkit_user_content_filter_store_new(storage.as_ptr());
+            ffi::webkit_user_content_filter_store_save(
+                store,
+                identifier.as_ptr(),
+                ToGlibPtr::<*const glib::ffi::GBytes>::to_glib_none(&rules).0 as *mut _,
+                std::ptr::null_mut(),
+                Some(saved),
+                Box::into_raw(Box::new(then)) as glib::ffi::gpointer,
+            );
+            glib::gobject_ffi::g_object_unref(store as *mut _);
+        }
+    }
+
+    fn load(manager: &UserContentManager, html: &str, path: PathBuf, job: &SharedJob) {
+        let settings = webkit2gtk::Settings::new();
+        settings.set_enable_javascript(false);
+        let view = WebView::builder()
+            .user_content_manager(manager)
+            .settings(&settings)
+            .build();
+
+        let gate = job.clone();
+        view.connect_decide_policy(move |_, decision, kind| match kind {
+            PolicyDecisionType::NavigationAction => {
+                let mut job = gate.borrow_mut();
+                if job.navigated {
+                    decision.ignore();
+                } else {
+                    job.navigated = true;
+                    decision.use_();
+                }
+                true
+            }
+            PolicyDecisionType::NewWindowAction => {
+                decision.ignore();
+                true
+            }
+            _ => false,
+        });
+
+        let loaded = job.clone();
+        view.connect_load_changed(move |view, event| {
+            if event == LoadEvent::Finished && start(&loaded) {
+                print(view, &path, &loaded);
+            }
+        });
+        let failed = job.clone();
+        view.connect_load_failed(move |_, _, _, error| {
+            if start(&failed) {
+                finish(&failed, Err(error.to_string()));
+            }
+            false
+        });
+
+        // Never placed in a window: drawing it makes WebKit request a GL context, which aborts.
+        job.borrow_mut().view = Some(view.clone());
+        view.load_html(html, None);
+    }
+
+    fn print(view: &WebView, path: &Path, job: &SharedJob) {
+        let Ok(uri) = url::Url::from_file_path(path) else {
+            finish(job, Err("Unsupported save location".into()));
+            return;
+        };
+        let settings = gtk::PrintSettings::new();
+        // GTK names its file printer with the translated string.
+        settings.set_printer(&glib::dgettext(Some("gtk30"), "Print to File"));
+        settings.set(&gtk::PRINT_SETTINGS_OUTPUT_FILE_FORMAT, Some("pdf"));
+        settings.set(&gtk::PRINT_SETTINGS_OUTPUT_URI, Some(uri.as_str()));
+        let page = gtk::PageSetup::new();
+        page.set_top_margin(MARGIN_VERTICAL_MM, gtk::Unit::Mm);
+        page.set_bottom_margin(MARGIN_VERTICAL_MM, gtk::Unit::Mm);
+        page.set_left_margin(MARGIN_HORIZONTAL_MM, gtk::Unit::Mm);
+        page.set_right_margin(MARGIN_HORIZONTAL_MM, gtk::Unit::Mm);
+
+        let operation = PrintOperation::new(view);
+        operation.set_print_settings(&settings);
+        operation.set_page_setup(&page);
+        let failed = job.clone();
+        operation.connect_failed(move |_, error| {
+            failed.borrow_mut().error = Some(error.to_string());
+        });
+        let finished = job.clone();
+        operation.connect_finished(move |_| {
+            let error = finished.borrow_mut().error.take();
+            finish(&finished, error.map_or(Ok(()), Err));
+        });
+        job.borrow_mut().operation = Some(operation.clone());
+        operation.print();
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     #![allow(unexpected_cfgs)]
@@ -239,15 +740,6 @@ mod macos {
         started: bool,
         done: Option<Done>,
     }
-
-    /// Blocks every network and file load, whatever the document's markup; `data:` and
-    /// `about:` stay allowed. Complements the CSP in case the meta tag lands somewhere ignored.
-    const BLOCK_NETWORK_RULES: &str = r#"[
-        {"trigger": {"url-filter": "^https?:"}, "action": {"type": "block"}},
-        {"trigger": {"url-filter": "^wss?:"}, "action": {"type": "block"}},
-        {"trigger": {"url-filter": "^ftp:"}, "action": {"type": "block"}},
-        {"trigger": {"url-filter": "^file:"}, "action": {"type": "block"}}
-    ]"#;
 
     const NAVIGATION_CANCEL: isize = 0;
     const NAVIGATION_ALLOW: isize = 1;
@@ -455,7 +947,7 @@ mod macos {
             let store: id = msg_send![class!(WKContentRuleListStore), defaultStore];
             let _: () = msg_send![store,
                 compileContentRuleListForIdentifier: ns_string("LumoPdfExportBlockNetwork")
-                encodedContentRuleList: ns_string(BLOCK_NETWORK_RULES)
+                encodedContentRuleList: ns_string(super::BLOCK_NETWORK_RULES)
                 completionHandler: &*compiled];
         }
     }
@@ -535,18 +1027,24 @@ mod tests {
     }
 
     #[test]
-    fn the_csp_is_the_first_element_of_the_head() {
-        let html = r#"<!DOCTYPE html><html><HEAD lang="en"><title>t</title></head><body><img src="https://evil.example/p"></body></html>"#;
-        assert_eq!(csp_at(html), html.find("<title>").unwrap());
-        assert!(with_csp(html).starts_with("<!DOCTYPE html>"));
+    fn the_csp_follows_the_doctype() {
+        let html = "<!DOCTYPE html><html><head><title>t</title></head><body></body></html>";
+        assert_eq!(csp_at(html), "<!DOCTYPE html>".len());
         assert!(with_csp(html).contains(EXPORT_CSP));
     }
 
     #[test]
-    fn the_csp_never_lands_in_a_header_or_the_body() {
-        let html = "<!doctype html><body><header>x</header><head></head></body>";
-        assert_eq!(csp_at(html), "<!doctype html>".len());
-        assert_eq!(csp_at("<div><header>x</header></div>"), 0);
+    fn markup_cannot_move_the_csp() {
+        let after_doctype = "<!doctype html>".len();
+        assert_eq!(
+            csp_at("<!doctype html><!-- <head> --><body></body>"),
+            after_doctype
+        );
+        assert_eq!(
+            csp_at("<!doctype html><title><head></title>"),
+            after_doctype
+        );
+        assert_eq!(csp_at("<!-- <head> --><html><body></body></html>"), 0);
     }
 
     #[test]

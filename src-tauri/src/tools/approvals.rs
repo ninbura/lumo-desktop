@@ -120,6 +120,7 @@ impl ApprovalGate for InteractiveApprovalGate {
         tool_name: &str,
         input: &Value,
         reason: Option<&ApprovalReason>,
+        conversation: Option<&str>,
     ) -> ApprovalDecision {
         let (request_id, rx) = register();
         if self
@@ -132,6 +133,7 @@ impl ApprovalGate for InteractiveApprovalGate {
                     "tool_name": tool_name,
                     "input": super::hidden_text::reveal(input),
                     "reason": reason,
+                    "conversation_id": conversation,
                 }),
             )
             .is_err()
@@ -147,7 +149,11 @@ impl ApprovalGate for InteractiveApprovalGate {
                     .app_handle
                     .emit(
                         "tool:approval_resolved",
-                        serde_json::json!({ "request_id": request_id, "approved": false }),
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "approved": false,
+                            "conversation_id": conversation,
+                        }),
                     )
                     .is_err()
                 {

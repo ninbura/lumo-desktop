@@ -3,7 +3,7 @@ const path = require('node:path');
 const { runTool, waitForPendingCount, waitForResult, waitForStubReady } = require('../support/waits');
 
 // The specs run in Node beside the app, so a real side effect is asserted on disk rather
-// than through the DOM. seed-fixtures.sh includes scratch in the allowed roots.
+// than through the DOM. The fixtures allow scratch and leave the escape path outside both roots.
 const scratch = process.env.LUMO_E2E_SCRATCH;
 
 describe('writing a file through the filesystem connector', () => {
@@ -25,7 +25,7 @@ describe('writing a file through the filesystem connector', () => {
     it('refuses a path outside the allowed root', async () => {
         await waitForStubReady();
 
-        const target = '/tmp/lumo-e2e-escape.txt';
+        const target = process.env.LUMO_E2E_ESCAPE;
 
         await runTool('filesystem__fs_write', { path: target, content: 'should not exist' });
         await waitForPendingCount(1);

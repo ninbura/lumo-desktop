@@ -1,10 +1,13 @@
 const { waitForStubReady } = require('../support/waits');
 
-// The suite runs inside the e2e container (see run.sh), which deliberately has no
-// Secret Service on the session bus (creating one needs a graphical prompter). So the
-// expected verdict is "unavailable"
-describe('secure storage detection on a machine with no credential store', () => {
-    it('reports storage unavailable when no Secret Service is on the session bus', async () => {
+// The Linux container deliberately has no Secret Service. Native macOS/Windows
+// runs expect an available store; Linux desktop runners can set the expectation.
+const expected = process.env.LUMO_E2E_EXPECT_SECURE_STORAGE || 'unavailable';
+if (!['available', 'unavailable'].includes(expected)) {
+    throw new Error('LUMO_E2E_EXPECT_SECURE_STORAGE must be available or unavailable');
+}
+describe('secure storage detection', () => {
+    it(`reports storage ${expected} for this runner`, async () => {
         await waitForStubReady();
 
         await browser.execute(() => {
@@ -25,6 +28,6 @@ describe('secure storage detection on a machine with no credential store', () =>
         );
 
         const verdict = await browser.execute(() => window.__secureStorageVerdict);
-        expect(verdict).toBe('unavailable');
+        expect(verdict).toBe(expected);
     });
 });

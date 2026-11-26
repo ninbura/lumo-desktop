@@ -5,7 +5,7 @@ use super::super::auth::{
 };
 use super::super::connector_state::{ConnectorState, ToolPolicy};
 use super::super::error::{AuthError, ToolError};
-use super::super::exposure::ApprovalReason;
+use super::super::exposure::{ApprovalReason, RequestUrl, ToolRisk};
 #[cfg(doc)]
 use super::ToolRegistry;
 use async_trait::async_trait;
@@ -29,6 +29,7 @@ pub trait ApprovalGate: Send + Sync {
         tool_name: &str,
         input: &Value,
         reason: Option<&ApprovalReason>,
+        conversation: Option<&str>,
     ) -> ApprovalDecision;
 }
 
@@ -159,6 +160,17 @@ pub trait Connector: Send + Sync {
     /// open-world hints and their descriptions. An MCP server added by hand could say anything.
     fn vetted(&self) -> bool {
         true
+    }
+
+    /// Inputs to the [`exposure`](super::super::exposure) gate for a tool. The default treats an
+    /// unclassified tool as an outside service that can send data.
+    fn risk(&self, _tool_name: &str) -> ToolRisk {
+        ToolRisk::default()
+    }
+
+    /// The URL a call requests, for connectors that fetch pages.
+    fn request_url(&self, _tool_name: &str, _input: &Value) -> Option<RequestUrl> {
+        None
     }
 
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError>;

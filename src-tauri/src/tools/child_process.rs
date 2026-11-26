@@ -1,17 +1,75 @@
 //! Shared process isolation for Shell commands, skill interpreters, and stdio MCP servers.
 
+#[cfg(target_os = "macos")]
+mod disclaim;
+mod env;
+#[cfg(target_os = "macos")]
+mod helper;
+
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject, KillOnDrop};
+use std::ffi::OsStr;
 use tokio::process::Command;
 #[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
+/// Runs first at startup. On macOS, a process Lumo started to launch a tool becomes that tool
+/// here, and otherwise later tool processes are set to launch that way, so that none of them
+/// can use the privacy permissions the user granted Lumo.
+pub(crate) fn prepare_tool_processes() {
+    #[cfg(target_os = "macos")]
+    disclaim::start();
+}
+
+/// What a tool process sees of Lumo's environment.
+pub(super) enum Environment {
+    Inherited,
+    /// Only the variables programs need to run; see [`env`].
+    Allowlisted,
+}
+
+/// The only way to start a tool: without Lumo's privacy permissions, in its own process tree,
+/// and with the environment the caller chose. Callers add arguments, further variables, working
+/// directory and stdio through `command_mut`.
+pub(super) fn tool_process(program: impl AsRef<OsStr>, environment: Environment) -> CommandWrap {
+    let mut command = tool_command(program);
+    if let Environment::Allowlisted = environment {
+        command.env_clear();
+        command.envs(env::inherited_env(std::env::vars_os()));
+    }
+    background_command(command)
+}
+
+/// On macOS, keeps the helper that tool processes run under in `data_dir`.
+pub(crate) fn install_tool_helper(data_dir: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = helper::install(data_dir) {
+        log::warn!("tools helper not installed: {:?}", error.kind());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = data_dir;
+}
+
+/// A command that runs `program` as a tool, without Lumo's privacy permissions.
+fn tool_command(program: impl AsRef<OsStr>) -> Command {
+    #[cfg(target_os = "macos")]
+    if let Some(trampoline) = disclaim::trampoline() {
+        let mut command = Command::new(trampoline);
+        command.arg(disclaim::FLAG);
+        if let Some(helper) = helper::executable() {
+            command.arg(helper);
+        }
+        command.arg(program);
+        return command;
+    }
+    Command::new(program)
+}
+
 /// Keep background tools out of a console window and manage their process trees together.
-/// Callers retain control of arguments, environment, working directory, and stdio.
-pub(super) fn background_command(command: Command) -> CommandWrap {
+fn background_command(command: Command) -> CommandWrap {
     let mut command = CommandWrap::from(command);
     #[cfg(unix)]
     command.wrap(ProcessGroup::leader());

@@ -1,11 +1,14 @@
-use super::auth::{active_secret_store, Interactive, SecretStore, SecureStorageStatus};
+use super::auth::{active_secret_store, Interactive, SecureStorageStatus};
 use super::connector_state::{save_connector_state, ToolPolicy};
-use super::connectors::mcp::{destination_fingerprint, validate_server_id};
+use super::connectors::mcp::{connector_id, on_config_change, on_remove, validate_server_id};
 use super::connectors::{load_mcp_servers, save_mcp_servers, McpConnector, McpServerConfig};
 use super::registry::{
     ApprovalDecision, CallContext, ConnectorManifest, ToolDefinition, ToolRegistry,
 };
-use super::{emit_connector_changed, emit_connectors_changed};
+use super::{
+    emit_connector_changed, emit_connector_lifecycle, emit_connectors_changed, ConnectorKind,
+    ConnectorLifecycle, ConnectorLifecycleChange, MCP_CONNECTOR_PREFIX,
+};
 use crate::account::{record_request_account, AccountId, ActiveAccount};
 use crate::schedules::{bridge::ScheduleToolContext, coordinator::ScheduleCoordinator};
 use log::{debug, info, warn};
@@ -15,41 +18,47 @@ use tauri_plugin_dialog::DialogExt;
 
 const TOOL_RESULT_LOG_LIMIT: usize = 4_000;
 
+/// Whether connecting or disconnecting a catalog connector added or removed it, judged by whether
+/// it had ever connected before and after the call. Repeat connects ("Save and test") and
+/// disconnecting one that never connected report nothing. MCP servers are counted when they are
+/// saved and removed instead, since their connect also runs for "Refresh tools".
+fn catalog_lifecycle(
+    connector_id: &str,
+    was_connected: bool,
+    is_connected: bool,
+) -> Option<ConnectorLifecycleChange> {
+    if connector_id.starts_with(MCP_CONNECTOR_PREFIX) {
+        return None;
+    }
+    let action = match (was_connected, is_connected) {
+        (false, true) => ConnectorLifecycle::Added,
+        (true, false) => ConnectorLifecycle::Removed,
+        _ => return None,
+    };
+    Some(ConnectorLifecycleChange {
+        action,
+        kind: ConnectorKind::Catalog,
+    })
+}
+
+/// Settings marks the servers it saves or removes from the catalog's featured list (Slack, Google
+/// Drive, …) as `featured`; those count as catalog connectors, everything else as a custom server.
+fn mcp_lifecycle(action: ConnectorLifecycle, featured: bool) -> ConnectorLifecycleChange {
+    ConnectorLifecycleChange {
+        action,
+        kind: if featured {
+            ConnectorKind::Catalog
+        } else {
+            ConnectorKind::Mcp
+        },
+    }
+}
+
 /// Whether two saved configurations point at the same server in the same way.
 ///
 /// Display-name and description edits keep history; changing where or how it connects does not.
 fn same_transport(before: &McpServerConfig, after: &McpServerConfig) -> bool {
     serde_json::to_value(&before.transport).ok() == serde_json::to_value(&after.transport).ok()
-}
-
-/// Whether stored secrets can stay: same destination and the same auth mode. A mode change
-/// must clear them too, or a token left by `Token@A → None@A` would be sent on `→ Token@B`.
-/// The keychain enforces the same rule on load, for edits that bypass this form.
-fn keeps_credentials(before: &McpServerConfig, after: &McpServerConfig) -> bool {
-    destination_fingerprint(before) == destination_fingerprint(after)
-}
-
-/// Keys to clear before saving `next`: none while credentials stay valid, else everything the
-/// id may hold. A first save also clears, sweeping entries a removed server left behind.
-fn stale_secret_keys(existing: Option<&McpServerConfig>, next: &McpServerConfig) -> Vec<String> {
-    match existing {
-        Some(previous) if keeps_credentials(previous, next) => vec![],
-        Some(previous) => super::connectors::mcp::secret_keys_for_id(&next.id, &[previous, next]),
-        None => super::connectors::mcp::secret_keys_for_id(&next.id, &[next]),
-    }
-}
-
-/// Fails on the first error so the caller can leave the config untouched: the keychain
-/// backends already treat a missing key as success, and defer a delete the keychain can't do
-/// yet, so an error means the secret could still be loaded.
-async fn delete_secrets(secrets: &dyn SecretStore, keys: &[String]) -> Result<(), String> {
-    for key in keys {
-        secrets
-            .delete(key)
-            .await
-            .map_err(|e| format!("could not clear stored credentials: {e}"))?;
-    }
-    Ok(())
 }
 
 fn require_account(active: &ActiveAccount) -> Result<AccountId, String> {
@@ -399,6 +408,7 @@ pub async fn connect_connector(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     record_request_account(&app_handle, user_id.as_deref()).await?;
+    let was_connected = registry.has_ever_succeeded(&connector_id);
     registry
         .connect_attempt(
             &connector_id,
@@ -413,6 +423,13 @@ pub async fn connect_connector(
         })?;
 
     emit_connector_changed(&app_handle, &connector_id);
+    if let Some(change) = catalog_lifecycle(
+        &connector_id,
+        was_connected,
+        registry.has_ever_succeeded(&connector_id),
+    ) {
+        emit_connector_lifecycle(&app_handle, change);
+    }
     Ok(())
 }
 
@@ -437,23 +454,32 @@ pub async fn disconnect_connector(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     record_request_account(&app_handle, user_id.as_deref()).await?;
+    let was_connected = registry.has_ever_succeeded(&connector_id);
     registry
         .disconnect(&connector_id)
         .await
         .map_err(|e| e.to_ipc_string())?;
     emit_connector_changed(&app_handle, &connector_id);
+    if let Some(change) = catalog_lifecycle(
+        &connector_id,
+        was_connected,
+        registry.has_ever_succeeded(&connector_id),
+    ) {
+        emit_connector_lifecycle(&app_handle, change);
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn save_mcp_server(
     server: McpServerConfig,
+    featured: Option<bool>,
     app_handle: AppHandle,
     active: State<'_, ActiveAccount>,
     registry: State<'_, ToolRegistry>,
 ) -> Result<(), String> {
     validate_server_id(&server.id)?;
-    let connector_id = format!("mcp-{}", server.id);
+    let connector_id = connector_id(&server.id);
     let _operation = registry
         .try_connector_operation(&connector_id)
         .map_err(|e| e.to_ipc_string())?;
@@ -463,11 +489,9 @@ pub async fn save_mcp_server(
     let previous = existing.map(|index| &servers[index]);
     let transport_changed = previous.is_none_or(|previous| !same_transport(previous, &server));
 
-    // Before the save: if a delete fails, the old config keeps the old secrets tied to the old
-    // destination.
+    // Must precede the save.
     let secrets = active_secret_store(&active)?;
-    let stale_keys = stale_secret_keys(previous, &server);
-    delete_secrets(secrets.as_ref(), &stale_keys).await?;
+    on_config_change(secrets.as_ref(), previous, &server).await?;
 
     match existing {
         Some(index) => servers[index] = server.clone(),
@@ -484,6 +508,12 @@ pub async fn save_mcp_server(
                 .await,
         )
         .await;
+    if existing.is_none() {
+        emit_connector_lifecycle(
+            &app_handle,
+            mcp_lifecycle(ConnectorLifecycle::Added, featured.unwrap_or(false)),
+        );
+    }
     Ok(())
 }
 
@@ -498,11 +528,12 @@ pub fn list_mcp_servers(
 #[tauri::command]
 pub async fn remove_mcp_server(
     server_id: String,
+    featured: Option<bool>,
     app_handle: AppHandle,
     active: State<'_, ActiveAccount>,
     registry: State<'_, ToolRegistry>,
 ) -> Result<(), String> {
-    let connector_id = format!("mcp-{server_id}");
+    let connector_id = connector_id(&server_id);
     let _operation = registry
         .try_connector_operation(&connector_id)
         .map_err(|e| e.to_ipc_string())?;
@@ -510,11 +541,10 @@ pub async fn remove_mcp_server(
     let mut servers = load_mcp_servers(&app_handle, &account)?;
     let removed: Vec<&McpServerConfig> = servers.iter().filter(|s| s.id == server_id).collect();
 
-    // Before the save, so a failed delete leaves the server listed rather than leaving its
-    // secrets behind for the next server saved under this id.
+    // Must precede the save.
     let secrets = active_secret_store(&active)?;
-    let keys = super::connectors::mcp::secret_keys_for_id(&server_id, &removed);
-    delete_secrets(secrets.as_ref(), &keys).await?;
+    let was_listed = !removed.is_empty();
+    on_remove(secrets.as_ref(), &server_id, &removed).await?;
 
     servers.retain(|s| s.id != server_id);
     save_mcp_servers(&app_handle, &account, &servers)?;
@@ -532,6 +562,12 @@ pub async fn remove_mcp_server(
     let _ = save_connector_state(&app_handle, &account, &registry.state_snapshot());
 
     emit_connector_changed(&app_handle, &connector_id);
+    if was_listed {
+        emit_connector_lifecycle(
+            &app_handle,
+            mcp_lifecycle(ConnectorLifecycle::Removed, featured.unwrap_or(false)),
+        );
+    }
     Ok(())
 }
 
@@ -570,8 +606,45 @@ pub async fn on_settings_saved(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::auth::{DeniedSecrets, InMemorySecrets};
-    use crate::tools::connectors::mcp::{HttpAuth, McpTransport};
+    use crate::tools::connectors::mcp::McpTransport;
+
+    #[test]
+    fn only_a_first_connect_or_a_real_disconnect_of_a_catalog_connector_counts() {
+        let added = Some(ConnectorLifecycleChange {
+            action: ConnectorLifecycle::Added,
+            kind: ConnectorKind::Catalog,
+        });
+        let removed = Some(ConnectorLifecycleChange {
+            action: ConnectorLifecycle::Removed,
+            kind: ConnectorKind::Catalog,
+        });
+
+        assert_eq!(catalog_lifecycle("luminance", false, true), added);
+        assert_eq!(catalog_lifecycle("luminance", true, false), removed);
+        // "Save and test" on a connected connector, and a failed or repeated disconnect.
+        assert_eq!(catalog_lifecycle("luminance", true, true), None);
+        assert_eq!(catalog_lifecycle("luminance", false, false), None);
+        // MCP servers are counted on save and removal; "Refresh tools" reconnects them.
+        assert_eq!(catalog_lifecycle("mcp-github", false, true), None);
+        assert_eq!(catalog_lifecycle("mcp-github", true, false), None);
+    }
+
+    #[test]
+    fn lifecycle_changes_serialize_to_what_the_web_app_accepts() {
+        assert_eq!(
+            serde_json::to_value(mcp_lifecycle(ConnectorLifecycle::Added, false)).unwrap(),
+            serde_json::json!({ "action": "added", "kind": "mcp" })
+        );
+        // A featured catalog server such as Slack is a catalog connector, not a custom one.
+        assert_eq!(
+            serde_json::to_value(mcp_lifecycle(ConnectorLifecycle::Removed, true)).unwrap(),
+            serde_json::json!({ "action": "removed", "kind": "catalog" })
+        );
+        assert_eq!(
+            serde_json::to_value(catalog_lifecycle("proton-mail", true, false).unwrap()).unwrap(),
+            serde_json::json!({ "action": "removed", "kind": "catalog" })
+        );
+    }
 
     #[test]
     fn log_preview_preserves_unicode_at_the_byte_limit() {
@@ -608,118 +681,6 @@ mod tests {
 
         assert!(same_transport(&before, &renamed));
         assert!(!same_transport(&before, &repointed));
-    }
-
-    fn http(id: &str, url: &str, scopes: &[&str]) -> McpServerConfig {
-        McpServerConfig {
-            id: id.into(),
-            display_name: id.into(),
-            description: None,
-            transport: McpTransport::Http {
-                url: url.into(),
-                auth: crate::tools::connectors::mcp::HttpAuth::Oauth {
-                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
-                    client_id: None,
-                    resource: None,
-                    authorize_params: Default::default(),
-                },
-                request_headers: Default::default(),
-            },
-        }
-    }
-
-    #[test]
-    fn secrets_stay_with_a_server_only_while_it_points_at_the_same_place() {
-        let before = http("github", "https://api.example.com/mcp", &["repo"]);
-        let rescoped = http("github", "https://api.example.com/mcp", &["repo", "user"]);
-        let repointed = http("github", "https://evil.example/mcp", &["repo"]);
-
-        assert!(keeps_credentials(&before, &rescoped));
-        assert!(!keeps_credentials(&before, &repointed));
-        assert!(!keeps_credentials(&stdio("x", "npx"), &stdio("x", "sh")));
-        assert!(!keeps_credentials(&before, &stdio("github", "npx")));
-    }
-
-    fn http_with(id: &str, url: &str, auth: HttpAuth) -> McpServerConfig {
-        McpServerConfig {
-            id: id.into(),
-            display_name: id.into(),
-            description: None,
-            transport: McpTransport::Http {
-                url: url.into(),
-                auth,
-                request_headers: Default::default(),
-            },
-        }
-    }
-
-    fn token(url: &str) -> McpServerConfig {
-        http_with(
-            "github",
-            url,
-            HttpAuth::Token {
-                scheme: "Bearer".into(),
-            },
-        )
-    }
-
-    fn no_auth(url: &str) -> McpServerConfig {
-        http_with("github", url, HttpAuth::None)
-    }
-
-    async fn save(secrets: &dyn SecretStore, previous: &McpServerConfig, next: &McpServerConfig) {
-        delete_secrets(secrets, &stale_secret_keys(Some(previous), next))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_token_does_not_survive_an_auth_mode_round_trip_to_another_url() {
-        let secrets = InMemorySecrets::with(&[("mcp-github:token", "token-for-a")]);
-        let (token_a, none_a, token_b) = (
-            token("https://a.example/mcp"),
-            no_auth("https://a.example/mcp"),
-            token("https://b.example/mcp"),
-        );
-
-        save(secrets.as_ref(), &token_a, &none_a).await;
-        save(secrets.as_ref(), &none_a, &token_b).await;
-
-        assert_eq!(secrets.load("mcp-github:token").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn credentials_stay_while_the_destination_and_auth_mode_are_unchanged() {
-        let secrets = InMemorySecrets::with(&[("mcp-github:token", "kept")]);
-        let renamed = McpServerConfig {
-            display_name: "GitHub".into(),
-            ..token("https://a.example/mcp")
-        };
-
-        save(secrets.as_ref(), &token("https://a.example/mcp"), &renamed).await;
-
-        assert_eq!(
-            secrets.load("mcp-github:token").await.unwrap().as_deref(),
-            Some("kept")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_first_save_sweeps_secrets_left_under_the_same_id() {
-        let secrets = InMemorySecrets::with(&[("mcp-github:token", "left-behind")]);
-        let keys = stale_secret_keys(None, &token("https://b.example/mcp"));
-        delete_secrets(secrets.as_ref(), &keys).await.unwrap();
-        assert_eq!(secrets.load("mcp-github:token").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_delete_that_cannot_be_performed_or_deferred_stops_the_save() {
-        let keys = stale_secret_keys(
-            Some(&token("https://a.example/mcp")),
-            &token("https://b.example/mcp"),
-        );
-        let denied = DeniedSecrets::shared();
-        assert!(delete_secrets(denied.as_ref(), &keys).await.is_err());
     }
 
     #[test]

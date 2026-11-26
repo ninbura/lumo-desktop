@@ -33,7 +33,11 @@ pub fn web_app_capability(lumo_url: &str) -> Result<String, String> {
 }
 
 pub fn build(app: &App) -> tauri::Result<WebviewWindow> {
-    let window = tauri::WebviewWindowBuilder::new(app, LABEL, webview::main_window_url())
+    let window = tauri::WebviewWindowBuilder::new(app, LABEL, webview::main_window_url());
+    // Ephemeral storage also isolates WKWebView, where data_directory is unsupported.
+    #[cfg(feature = "e2e-webdriver")]
+    let window = window.incognito(true);
+    let window = window
         .title("Lumo: Your Private AI Assistant")
         .visible(crate::e2e_testing_enabled())
         .inner_size(1200.0, 800.0)
@@ -103,11 +107,10 @@ fn allow_microphone(window: &WebviewWindow) {
             else {
                 return false;
             };
-            let on_web_app = view
-                .uri()
-                .and_then(|uri| uri.parse::<url::Url>().ok())
-                .is_some_and(|url| crate::microphone::is_allowed(&url));
-            if on_web_app && media.is_for_audio_device() && !media.is_for_video_device() {
+            let page = view.uri().and_then(|uri| uri.parse::<url::Url>().ok());
+            let microphone_only = media.is_for_audio_device() && !media.is_for_video_device();
+            // WebKitGTK doesn't say which frame asked, so the page stands in for it.
+            if crate::microphone::grants(microphone_only, true, page.as_ref()) {
                 media.allow();
             } else {
                 media.deny();

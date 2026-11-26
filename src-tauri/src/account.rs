@@ -7,7 +7,7 @@ use tokio::sync::watch;
 
 const MAX_LEN: usize = 128;
 
-/// Account the app acts as under `LUMO_E2E_TESTING`. Must match `e2e/seed-fixtures.sh`.
+/// Account the app acts as under `LUMO_E2E_TESTING`. Must match `e2e/support/fixtures.js`.
 const E2E_ACCOUNT: &str = "e2e-test-account";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +132,10 @@ async fn become_account(app_handle: &AppHandle, next: Option<AccountId>) {
     };
     if !active.set(next.clone()) {
         return;
+    }
+    // A late browser callback would otherwise send the signed-in webview to the used fork.
+    if next.is_some() {
+        crate::browser_login::discard_pending(app_handle);
     }
     if let Some(cache) = app_handle.try_state::<super::skills::SkillCache>() {
         cache.activate(next.clone());

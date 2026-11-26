@@ -4,6 +4,8 @@ mod browser_login;
 mod dialog;
 mod downloads;
 mod feature_flags;
+#[cfg(target_os = "macos")]
+mod macos_overrides;
 mod main_window;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod microphone;

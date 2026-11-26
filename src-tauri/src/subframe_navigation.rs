@@ -7,10 +7,9 @@
 
 use std::sync::OnceLock;
 
+use crate::macos_overrides::replace_method;
 use log::warn;
-use objc::runtime::{
-    class_getInstanceMethod, method_setImplementation, Class, Imp, Object, Sel, BOOL, NO,
-};
+use objc::runtime::{Class, Imp, Object, Sel, BOOL, NO};
 use objc::{msg_send, sel, sel_impl};
 
 /// Clang block ABI header, enough to call a block taking a `WKNavigationActionPolicy`.
@@ -45,25 +44,28 @@ extern "C" fn decide_policy(
     }
 }
 
-/// Downloads stay with wry, which routes them to the app's download handler.
+/// Whether a navigation is allowed without asking wry: only one inside an iframe. A new-window
+/// request has no target frame, and downloads stay with wry, which routes them to the app's
+/// download handler.
+fn skips_handler(target_is_main_frame: Option<bool>, download: bool) -> bool {
+    target_is_main_frame == Some(false) && !download
+}
+
 fn is_subframe_navigation(action: *mut Object) -> bool {
     unsafe {
         let frame: *mut Object = msg_send![action, targetFrame];
-        if frame.is_null() {
-            return false;
-        }
-        let is_main: BOOL = msg_send![frame, isMainFrame];
-        if is_main != NO {
-            return false;
-        }
+        let target_is_main_frame = if frame.is_null() {
+            None
+        } else {
+            let is_main: BOOL = msg_send![frame, isMainFrame];
+            Some(is_main != NO)
+        };
         let can_download: BOOL = msg_send![action, respondsToSelector: sel!(shouldPerformDownload)];
-        if can_download != NO {
+        let download = can_download != NO && {
             let download: BOOL = msg_send![action, shouldPerformDownload];
-            if download != NO {
-                return false;
-            }
-        }
-        true
+            download != NO
+        };
+        skips_handler(target_is_main_frame, download)
     }
 }
 
@@ -84,17 +86,26 @@ pub fn install(window: &tauri::WebviewWindow) {
 
 fn replace_decide_policy(class: &Class) {
     unsafe {
-        let method = class_getInstanceMethod(
-            class,
-            sel!(webView:decidePolicyForNavigationAction:decisionHandler:),
-        );
-        if method.is_null() {
+        let imp: Imp = std::mem::transmute(decide_policy as DecidePolicy);
+        let selector = sel!(webView:decidePolicyForNavigationAction:decisionHandler:);
+        let Some(wry) = replace_method(class, selector, imp) else {
             warn!("{} has no navigation policy method, iframes will go through the navigation handler", class.name());
             return;
-        }
-        let imp: Imp = std::mem::transmute(decide_policy as DecidePolicy);
-        let wry: DecidePolicy =
-            std::mem::transmute(method_setImplementation(method as *mut _, imp));
-        let _ = WRY_DECIDE_POLICY.set(wry);
+        };
+        let _ = WRY_DECIDE_POLICY.set(std::mem::transmute::<Imp, DecidePolicy>(wry));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skips_handler;
+
+    #[test]
+    fn only_iframe_navigations_skip_the_navigation_handler() {
+        assert!(skips_handler(Some(false), false));
+
+        assert!(!skips_handler(Some(true), false), "the main frame");
+        assert!(!skips_handler(None, false), "a new window");
+        assert!(!skips_handler(Some(false), true), "a download in an iframe");
     }
 }

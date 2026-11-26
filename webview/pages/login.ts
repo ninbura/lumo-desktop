@@ -14,7 +14,8 @@ const HINTS = {
 /* The shell navigates this window away once the fork is handed over, so there is no success
  * state to render here. Requesting sign-in twice is meaningful rather than a mistake: the
  * second request completes a sign-in the browser could not report back, which is why the
- * button stays enabled. */
+ * button stays enabled. The first request on a fresh page always starts a new sign-in, so a
+ * failed redemption that reloads this page leaves the pending one to the browser callback. */
 let started = false;
 
 const setState = (state: keyof typeof HINTS) => {
@@ -24,7 +25,7 @@ const setState = (state: keyof typeof HINTS) => {
 
 button.addEventListener('click', async () => {
     try {
-        await tauriInvoke('start_browser_login');
+        await tauriInvoke('start_browser_login', { redeem: started });
         started = true;
         button.textContent = "I've signed in";
         setState('waiting');

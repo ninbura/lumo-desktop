@@ -3,7 +3,8 @@ const path = require('node:path');
 const { textOf, waitForStubReady } = require('../support/waits');
 const { accountId, request, connect, queueRun } = require('../support/schedules');
 
-const storePath = path.join(process.env.XDG_CONFIG_HOME, 'me.proton.lumo-app', 'accounts', accountId, 'schedules.json');
+const configDir = process.env.LUMO_E2E_CONFIG_DIR;
+const storePath = path.join(configDir, 'accounts', accountId, 'schedules.json');
 
 describe('schedule bridge through the real desktop app', () => {
     it('recovers from unavailable event support before connecting', async () => {

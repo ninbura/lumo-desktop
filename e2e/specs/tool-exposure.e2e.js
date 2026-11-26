@@ -14,7 +14,7 @@ describe('tool approvals after untrusted content reaches the conversation', () =
         await setPolicy('filesystem', 'fs_edit', 'auto_approve');
         await setPolicy(mcpId, 'write', 'auto_approve');
         // Real shell output reaches the production exposure tracker; no mock state.
-        await executeTool('bash__run', { command: 'printf untrusted-e2e-content' });
+        await executeTool('bash__run', { command: 'echo untrusted-e2e-content' });
         const read = { marker: marker() };
         await runTool(`${mcpId}__read`, read);
         expect(await approvalReason()).toEqual({ kind: 'untrusted_content', sources: ['shell', 'connector'] });

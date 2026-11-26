@@ -5,12 +5,12 @@ mod migrations;
 mod tool_cache;
 
 pub use config::{
-    load_mcp_servers, save_mcp_servers, validate_server_id, CustomHeader, HttpAuth,
+    connector_id, load_mcp_servers, save_mcp_servers, validate_server_id, CustomHeader, HttpAuth,
     McpServerConfig, McpTransport,
 };
 #[cfg(test)]
 use credentials::secret_keys;
-pub use credentials::{destination_fingerprint, secret_keys_for_id};
+pub use credentials::{on_config_change, on_remove};
 use migrations::migrate_legacy_endpoints;
 pub use tool_cache::{mcp_tools_path, NoToolCache, ToolCache};
 
@@ -18,10 +18,11 @@ use super::super::auth::{
     keychain_secrets, AuthMechanism, CredentialState, Interactive, McpTransportInfo, Readiness,
     Secrets, Stored,
 };
-use super::super::child_process::background_command;
+use super::super::child_process::{tool_process, Environment};
 use super::super::command_path;
 use super::super::connector_state::ToolPolicy;
 use super::super::error::{AuthError, ToolError};
+use super::super::exposure::ToolRisk;
 use super::super::hidden_text;
 use super::super::icons::bundled_icon_data_uri;
 use super::super::oauth::{
@@ -36,6 +37,7 @@ use async_trait::async_trait;
 use credentials::{
     client_secret_key, credential_state, env_secret_key, header_secret_key, token_key,
     BoundSecrets, KeychainCredentialStore, McpCredentialInput, UserAgentOAuthHttpClient,
+    CLIENT_USER_AGENT,
 };
 use log::{debug, info, warn};
 use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
@@ -45,7 +47,7 @@ use rmcp::transport::auth::{
     default_oauth_http_client, AuthClient, AuthorizationManager, OAuthClientConfig,
 };
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -53,7 +55,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tauri::AppHandle;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tool_cache::AccountToolCache;
 
@@ -77,9 +78,28 @@ fn vet(mut tool: ToolDefinition, catalog: bool) -> ToolDefinition {
     tool
 }
 
-fn tool_definition(tool: rmcp::model::Tool, catalog: bool) -> ToolDefinition {
+/// Drops every tool whose name appears more than once. Approvals are pinned per name, so a
+/// second definition under an approved name would carry the approval to a changed tool, and
+/// which copy the model acts on is up to the server.
+fn without_repeated_names(server_id: &str, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for tool in &tools {
+        *counts.entry(tool.name.clone()).or_default() += 1;
+    }
+    for (name, count) in &counts {
+        if *count > 1 {
+            warn!("mcp-{server_id}: dropped tool {name:?}, listed {count} times");
+        }
+    }
+    tools
+        .into_iter()
+        .filter(|tool| counts[&tool.name] == 1)
+        .collect()
+}
+
+fn tool_definition(tool: rmcp::model::Tool) -> ToolDefinition {
     let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
-    let definition = ToolDefinition {
+    ToolDefinition {
         policy: ToolPolicy::Ask,
         input_schema: tool.schema_as_json_value(),
         title: tool
@@ -90,102 +110,21 @@ fn tool_definition(tool: rmcp::model::Tool, catalog: bool) -> ToolDefinition {
         open_world: tool.annotations.as_ref().and_then(|a| a.open_world_hint),
         name: tool.name.to_string(),
         description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
-    };
-    vet(definition, catalog)
+    }
+}
+
+fn intake(
+    server_id: &str,
+    tools: impl IntoIterator<Item = ToolDefinition>,
+    catalog: bool,
+) -> Vec<ToolDefinition> {
+    let vetted = tools.into_iter().map(|tool| vet(tool, catalog));
+    without_repeated_names(server_id, vetted.collect())
 }
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const MCP_OAUTH_REDIRECT_PORTS: [u16; 3] = [9876, 9877, 9878];
-
-/// Variables a stdio server inherits from Lumo. Everything else is withheld, so a token exported
-/// in the user's shell profile doesn't reach every local server; a server that needs one gets it
-/// through its config's `env` or `secret_env`.
-const INHERITED_ENV: &[&str] = &[
-    // Identity, locale and scratch space.
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TERM",
-    "LANG",
-    "LANGUAGE",
-    "TZ",
-    "TMPDIR",
-    "__CF_USER_TEXT_ENCODING",
-    // Corporate networks.
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "ALL_PROXY",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "NODE_EXTRA_CA_CERTS",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    // Servers that open a browser or use the keyring on Linux.
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "XAUTHORITY",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "XDG_RUNTIME_DIR",
-    "XDG_SESSION_TYPE",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_DATA_DIRS",
-    "XDG_CONFIG_DIRS",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_STATE_HOME",
-    // Version managers whose shims the resolved PATH can point at.
-    "NVM_DIR",
-    "VOLTA_HOME",
-    "PYENV_ROOT",
-    "ASDF_DIR",
-    "ASDF_DATA_DIR",
-    // Windows programs fail to start, or fail oddly, without these.
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "PATHEXT",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "USERPROFILE",
-    "USERNAME",
-    "USERDOMAIN",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "TEMP",
-    "TMP",
-    "PROGRAMDATA",
-    "ALLUSERSPROFILE",
-    "PUBLIC",
-    "PROGRAMFILES",
-    "PROGRAMFILES(X86)",
-    "PROGRAMW6432",
-    "COMMONPROGRAMFILES",
-    "COMMONPROGRAMFILES(X86)",
-    "COMMONPROGRAMW6432",
-    "COMPUTERNAME",
-    "OS",
-    "PROCESSOR_ARCHITECTURE",
-    "NUMBER_OF_PROCESSORS",
-];
-
-/// Windows variable names are case-insensitive, and proxy variables are often lowercase.
-fn is_inherited(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    INHERITED_ENV.contains(&upper.as_str()) || upper.starts_with("LC_")
-}
-
-fn inherited_env(
-    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    vars.into_iter()
-        .filter(|(name, _)| name.to_str().is_some_and(is_inherited))
-        .collect()
-}
 
 /// The variables set on top of the inherited ones: the resolved search path, then the config's
 /// `env` laid over it.
@@ -215,11 +154,12 @@ impl McpConnector {
         credentials: CredentialState,
     ) -> Self {
         let catalog = catalog::is_catalog_server(&config);
+        let tools = Self::cached_tools(&config.id, tool_cache.as_ref(), catalog);
         Self {
-            id: format!("mcp-{}", config.id),
+            id: connector_id(&config.id),
             secrets: Arc::new(BoundSecrets::new(secrets, &config)),
             config,
-            tools: RwLock::new(Self::cached_tools(tool_cache.as_ref(), catalog)),
+            tools: RwLock::new(tools),
             tool_cache,
             client: Mutex::new(None),
             credentials: RwLock::new(credentials),
@@ -228,12 +168,8 @@ impl McpConnector {
         }
     }
 
-    fn cached_tools(cache: &dyn ToolCache, catalog: bool) -> Vec<ToolDefinition> {
-        cache
-            .load()
-            .into_iter()
-            .map(|tool| vet(tool, catalog))
-            .collect()
+    fn cached_tools(server_id: &str, cache: &dyn ToolCache, catalog: bool) -> Vec<ToolDefinition> {
+        intake(server_id, cache.load(), catalog)
     }
 
     /// Probes the keychain once, which is what keeps [`Connector::readiness`] synchronous.
@@ -456,13 +392,11 @@ impl McpConnector {
                     .await
                     .map_err(|e| ToolError::Unreachable(format!("{}: {e}", self.id)))?;
 
-                let command =
-                    background_command(Command::new(&resolved.program).configure(|cmd| {
-                        cmd.args(args);
-                        cmd.env_clear();
-                        cmd.envs(inherited_env(std::env::vars_os()));
-                        cmd.envs(child_env(&env, &resolved.search_path));
-                    }));
+                let mut command = tool_process(&resolved.program, Environment::Allowlisted);
+                command
+                    .command_mut()
+                    .args(args)
+                    .envs(child_env(&env, &resolved.search_path));
 
                 let (transport, stderr) = TokioChildProcess::builder(command)
                     .stderr(std::process::Stdio::piped())
@@ -526,23 +460,40 @@ impl McpConnector {
                     .map_err(ToolError::ExecutionFailed)?;
                 }
 
-                let auth_client = AuthClient::new(reqwest::Client::new(), manager);
+                let http = reqwest::Client::builder()
+                    .user_agent(CLIENT_USER_AGENT)
+                    .build()
+                    .map_err(|e| ToolError::ExecutionFailed(format!("http client: {e}")))?;
+                let auth_client = AuthClient::new(http, manager);
                 let transport = StreamableHttpClientTransport::with_client(
                     auth_client,
                     Self::http_transport_config(url, request_headers)?,
                 );
 
-                tokio::time::timeout(CONNECT_TIMEOUT, Self::mcp_client().serve(transport))
+                match tokio::time::timeout(CONNECT_TIMEOUT, Self::mcp_client().serve(transport))
                     .await
                     .map_err(|_| {
                         ToolError::Unreachable(format!(
                             "{}: no response within {CONNECT_TIMEOUT:?}",
                             self.id
                         ))
-                    })?
-                    .map_err(|e| {
-                        ToolError::Unreachable(format!("{}: initialize failed: {e}", self.id))
-                    })?
+                    })? {
+                    Ok(service) => service,
+                    Err(e) if e.is_authorization_required() => {
+                        self.secrets
+                            .delete(&self.id)
+                            .await
+                            .map_err(ToolError::ExecutionFailed)?;
+                        self.set_credentials(CredentialState::Absent);
+                        return Err(ToolError::NotAuthenticated);
+                    }
+                    Err(e) => {
+                        return Err(ToolError::Unreachable(format!(
+                            "{}: initialize failed: {e}",
+                            self.id
+                        )))
+                    }
+                }
             }
             McpTransport::Http {
                 url,
@@ -651,13 +602,13 @@ impl McpConnector {
             }
         };
 
-        let tools: Vec<ToolDefinition> = service
+        let listed = service
             .list_all_tools()
             .await
             .map_err(|e| ToolError::Unreachable(format!("{}: listing tools failed: {e}", self.id)))?
             .into_iter()
-            .map(|tool| tool_definition(tool, self.catalog))
-            .collect();
+            .map(tool_definition);
+        let tools = intake(&self.config.id, listed, self.catalog);
 
         self.tool_cache.save(&tools);
         *self
@@ -782,6 +733,13 @@ impl McpConnector {
             .await
             .map_err(AuthError::Failed)?;
 
+        let discovered_scopes;
+        let scopes = if scopes.is_empty() {
+            discovered_scopes = manager.select_scopes(None, &[]);
+            &discovered_scopes
+        } else {
+            scopes
+        };
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
         match client_id {
@@ -838,7 +796,7 @@ impl McpConnector {
             .tools
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Self::cached_tools(self.tool_cache.as_ref(), self.catalog);
+            Self::cached_tools(&self.config.id, self.tool_cache.as_ref(), self.catalog);
     }
 
     /// Separates a server that answered with an error from one the session could not reach.
@@ -880,6 +838,17 @@ impl McpConnector {
     }
 }
 
+/// A tool counts as not sending data only when a vetted server marks it read-only and
+/// closed-world. The MCP specification treats an absent `openWorldHint` as open.
+pub(crate) fn risk(tool: Option<&ToolDefinition>, vetted: bool) -> ToolRisk {
+    let read_only = tool.and_then(|tool| tool.read_only) == Some(true);
+    let open_world = tool.and_then(|tool| tool.open_world) != Some(false);
+    ToolRisk {
+        sends_data: !vetted || !read_only || open_world,
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Connector for McpConnector {
     fn id(&self) -> &str {
@@ -888,6 +857,14 @@ impl Connector for McpConnector {
 
     fn vetted(&self) -> bool {
         self.catalog
+    }
+
+    fn risk(&self, tool_name: &str) -> ToolRisk {
+        let tools = self.tools();
+        risk(
+            tools.iter().find(|tool| tool.name == tool_name),
+            self.catalog,
+        )
     }
 
     fn descriptor(&self) -> ConnectorDescriptor {

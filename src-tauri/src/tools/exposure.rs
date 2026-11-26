@@ -31,12 +31,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::hidden_text;
-use super::registry::ToolDefinition;
 
 const MAX_SEEN_URLS: usize = 10_000;
 const MAX_TRACKED_RUNS: usize = 64;
-/// Persisted, so bounded; the oldest conversations are forgotten first.
-pub(crate) const MAX_TRACKED_CONVERSATIONS: usize = 5_000;
+const MAX_TRACKED_CONVERSATIONS: usize = 5_000;
 const MAX_UNPROMPTED_LINKS: usize = 20;
 
 const REFUSED_IN_RUN: &str = "this scheduled run has read email or other untrusted content, so \
@@ -55,7 +53,7 @@ pub struct Exposure {
     web: bool,
     #[serde(default)]
     shell: bool,
-    /// Results from MCP servers and from connectors this module doesn't know.
+    /// Results from MCP servers and from connectors that don't classify their tools.
     #[serde(default)]
     service: bool,
     /// Descriptions of tools from a server added by hand. Never recorded, only added at the gate.
@@ -63,10 +61,29 @@ pub struct Exposure {
     tools: bool,
     /// Order of first exposure, so the oldest conversations are evicted first.
     #[serde(default)]
-    pub(crate) seq: u64,
+    seq: u64,
 }
 
 impl Exposure {
+    pub const NONE: Exposure = Exposure::of(false, false, false, false, false);
+    pub const PRIVATE: Exposure = Exposure::of(true, false, false, false, false);
+    pub const MAIL: Exposure = Exposure::of(true, true, false, false, false);
+    pub const WEB: Exposure = Exposure::of(false, false, true, false, false);
+    pub const SHELL: Exposure = Exposure::of(true, false, false, true, false);
+    pub const SERVICE: Exposure = Exposure::of(true, false, false, false, true);
+
+    const fn of(private: bool, mail: bool, web: bool, shell: bool, service: bool) -> Self {
+        Exposure {
+            private,
+            mail,
+            web,
+            shell,
+            service,
+            tools: false,
+            seq: 0,
+        }
+    }
+
     /// Merges `other`'s flags, returning whether anything changed.
     pub(crate) fn merge(&mut self, other: Exposure) -> bool {
         let before = *self;
@@ -116,95 +133,46 @@ impl Exposure {
     }
 }
 
-/// What a call's result adds to the model's context. Mail, web pages, shell output and what MCP
-/// servers return can be written by anyone; local files and Luminance are the user's own. A
-/// connector this function doesn't name counts as an outside service, so a new one is gated
-/// until someone classifies it.
-fn exposure_of(connector_id: &str, tool_name: &str) -> Exposure {
-    let private = Exposure {
-        private: true,
-        ..Default::default()
-    };
-    match (connector_id, tool_name) {
-        ("proton_mail", "list_messages" | "search_messages" | "read_message") => Exposure {
-            mail: true,
-            ..private
-        },
-        ("browser", _) => Exposure {
-            web: true,
-            ..Default::default()
-        },
-        ("bash", _) => Exposure {
-            shell: true,
-            ..private
-        },
-        ("proton_mail", _) | ("filesystem" | "luminance", _) => private,
-        ("echo", _) => Exposure::default(),
-        _ => Exposure {
-            service: true,
-            ..private
-        },
-    }
+/// Per-tool inputs to the gate, supplied by [`Connector::risk`](super::registry::Connector::risk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolRisk {
+    /// What a call's result adds to the model's context.
+    pub exposes: Exposure,
+    pub sends_data: bool,
+    /// Gated on untrusted content alone: a planted script or rewritten config takes effect later,
+    /// outside any approval.
+    pub changes_files: bool,
 }
 
-/// Whether a tool can send data off the machine. Luminance writes go to Proton but can share
-/// documents onwards. An MCP tool is trusted only when a vetted server marks it read-only and
-/// closed to the open world; the spec reads an absent `openWorldHint` as open. A tool this
-/// function doesn't name is assumed to send, so a new one is gated until someone classifies it.
-fn sends_data(
-    connector_id: &str,
-    tool_name: &str,
-    tool: Option<&ToolDefinition>,
-    vetted: bool,
-) -> bool {
-    let read_only = tool.and_then(|tool| tool.read_only) == Some(true);
-    let open_world = tool.and_then(|tool| tool.open_world) != Some(false);
-    match (connector_id, tool_name) {
-        ("proton_mail", "list_messages" | "search_messages" | "read_message") => false,
-        ("filesystem" | "echo", _) => false,
-        ("luminance", _) => !read_only,
-        (id, _) if id.starts_with("mcp-") => !vetted || !read_only || open_world,
-        _ => true,
-    }
-}
-
-/// Whether a tool changes the user's files. Untrusted content alone is enough to gate it: a
-/// planted script or a rewritten config acts later, outside any approval.
-fn changes_files(connector_id: &str, tool: Option<&ToolDefinition>) -> bool {
-    connector_id == "filesystem" && tool.and_then(|tool| tool.read_only) != Some(true)
-}
-
-/// The URL of a browser call that sends nothing but the URL itself.
-fn plain_get_url(connector_id: &str, tool_name: &str, input: &Value) -> Option<String> {
-    let is_empty = |key: &str| match input.get(key) {
-        None | Some(Value::Null) => true,
-        Some(Value::Object(map)) => map.is_empty(),
-        Some(_) => false,
-    };
-    let plain = match (connector_id, tool_name) {
-        ("browser", "navigate") => true,
-        ("browser", "fetch") => {
-            input
-                .get("method")
-                .and_then(Value::as_str)
-                .is_none_or(|method| method.eq_ignore_ascii_case("GET"))
-                && is_empty("headers")
-                && is_empty("body")
+impl Default for ToolRisk {
+    /// Fails closed: an unclassified tool is treated as an outside service that can send data.
+    fn default() -> Self {
+        ToolRisk {
+            exposes: Exposure::SERVICE,
+            sends_data: true,
+            changes_files: false,
         }
-        _ => false,
-    };
-    plain
-        .then(|| input.get("url").and_then(Value::as_str))
-        .flatten()
-        .and_then(normalize)
+    }
 }
 
-fn destination(connector_id: &str, input: &Value) -> Option<String> {
-    (connector_id == "browser")
-        .then(|| input.get("url").and_then(Value::as_str))
-        .flatten()
-        .and_then(|url| url::Url::parse(url).ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
+/// Supplied by [`Connector::request_url`](super::registry::Connector::request_url).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestUrl {
+    pub url: String,
+    /// The call sends nothing but the URL.
+    pub plain_get: bool,
+}
+
+impl RequestUrl {
+    fn plain_get_url(&self) -> Option<String> {
+        self.plain_get.then(|| normalize(&self.url)).flatten()
+    }
+
+    fn destination(&self) -> Option<String> {
+        url::Url::parse(&self.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+    }
 }
 
 fn normalize(raw: &str) -> Option<String> {
@@ -311,6 +279,42 @@ impl Gate {
     }
 }
 
+/// Exposure per conversation, persisted with the connector state so that a conversation resumed
+/// after a restart is still gated. Capped at `MAX_TRACKED_CONVERSATIONS`; the oldest entry is
+/// evicted first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Conversations(HashMap<String, Exposure>);
+
+impl Conversations {
+    pub(crate) fn exposure(&self, id: &str) -> Exposure {
+        self.0.get(id).copied().unwrap_or_default()
+    }
+
+    /// Returns whether the stored exposure changed.
+    pub(crate) fn expose(&mut self, id: &str, exposed: Exposure) -> bool {
+        if exposed.is_empty() {
+            return false;
+        }
+        if let Some(exposure) = self.0.get_mut(id) {
+            return exposure.merge(exposed);
+        }
+        if self.0.len() >= MAX_TRACKED_CONVERSATIONS {
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(_, exposure)| exposure.seq)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                self.0.remove(&oldest);
+            }
+        }
+        let seq = self.0.values().map(|e| e.seq).max().unwrap_or(0) + 1;
+        self.0.insert(id.to_string(), Exposure { seq, ..exposed });
+        true
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Tracker {
     session: Exposure,
@@ -332,23 +336,19 @@ impl Tracker {
         }
     }
 
-    /// `vetted` is [`Connector::vetted`](super::registry::Connector::vetted) for the tool's
-    /// connector.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn gate(
         &mut self,
-        connector_id: &str,
-        tool_name: &str,
-        tool: Option<&ToolDefinition>,
-        vetted: bool,
+        risk: ToolRisk,
+        request: Option<&RequestUrl>,
         input: &Value,
         scope: Scope,
         exposure: Exposure,
     ) -> Gate {
-        let outbound = sends_data(connector_id, tool_name, tool, vetted);
+        let outbound = risk.sends_data;
         let hidden = outbound && hidden_text::contains_hidden(input);
-        let writes = changes_files(connector_id, tool) && exposure.is_untrusted();
+        let writes = risk.changes_files && exposure.is_untrusted();
         let sends = outbound && exposure.is_risky();
+        let destination = || request.and_then(RequestUrl::destination);
         if !writes && !sends && !hidden {
             return Gate::Allow;
         }
@@ -363,7 +363,7 @@ impl Tracker {
             return Gate::Ask(ApprovalReason {
                 kind: "hidden_text",
                 sources: exposure.sources(),
-                destination: destination(connector_id, input),
+                destination: destination(),
             });
         }
         if writes {
@@ -373,7 +373,7 @@ impl Tracker {
                 destination: None,
             });
         }
-        if let Some(url) = plain_get_url(connector_id, tool_name, input) {
+        if let Some(url) = request.and_then(RequestUrl::plain_get_url) {
             let followed = self.links_followed.entry(scope.key()).or_default();
             if self.seen.contains(&seen_key(scope, &url)) && *followed < MAX_UNPROMPTED_LINKS {
                 *followed += 1;
@@ -383,7 +383,7 @@ impl Tracker {
         Gate::Ask(ApprovalReason {
             kind: "untrusted_content",
             sources: exposure.sources(),
-            destination: destination(connector_id, input),
+            destination: destination(),
         })
     }
 
@@ -391,12 +391,10 @@ impl Tracker {
     /// Returns what the call exposed, for the caller to add to a conversation.
     pub(crate) fn record(
         &mut self,
-        connector_id: &str,
-        tool_name: &str,
+        exposure: Exposure,
         scope: Scope,
         result: Option<&Value>,
     ) -> Exposure {
-        let exposure = exposure_of(connector_id, tool_name);
         self.session.merge(exposure);
         if let Scope::Run(run) = scope {
             if !self.runs.contains_key(run) {
@@ -439,6 +437,9 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::connectors::browser;
+    use crate::tools::registry::testing::{builtin_request_url, builtin_risk};
+    use crate::tools::registry::ToolDefinition;
     use serde_json::json;
 
     const MAIL: &str = "Hi! Details: https://evil.example/report?id=7 and \
@@ -453,7 +454,8 @@ mod tests {
 
     impl Harness {
         fn record(&mut self, connector: &str, tool: &str, scope: Scope, result: Value) {
-            let added = self.tracker.record(connector, tool, scope, Some(&result));
+            let exposes = builtin_risk(connector, tool, None, true).exposes;
+            let added = self.tracker.record(exposes, scope, Some(&result));
             if let Scope::Conversation(id) = scope {
                 self.conversations
                     .entry(id.into())
@@ -498,8 +500,13 @@ mod tests {
                 other => self.tracker.exposure(other),
             }
             .with_unvetted_tools(unvetted_offered);
-            self.tracker
-                .gate(connector, tool, Some(&def), vetted, &input, scope, exposure)
+            self.tracker.gate(
+                builtin_risk(connector, tool, Some(&def), vetted),
+                builtin_request_url(connector, tool, &input).as_ref(),
+                &input,
+                scope,
+                exposure,
+            )
         }
 
         fn gate(&mut self, connector: &str, tool: &str, input: Value, scope: Scope) -> Gate {
@@ -841,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn connectors_this_module_does_not_know_are_gated_as_outside_services() {
+    fn connectors_that_do_not_classify_their_tools_are_gated_as_outside_services() {
         let mut h = Harness::default();
         let b = Scope::Conversation("b");
         assert_eq!(h.gate("calendar", "list", json!({}), b), Gate::Allow);
@@ -860,7 +867,8 @@ mod tests {
     fn a_failed_call_still_counts_as_untrusted() {
         let mut h = Harness::default();
         h.record("filesystem", "fs_read", Scope::Session, json!("notes"));
-        h.tracker.record("browser", "fetch", Scope::Session, None);
+        h.tracker
+            .record(browser::risk().exposes, Scope::Session, None);
         assert!(asks(&h.gate(
             "browser",
             "fetch",

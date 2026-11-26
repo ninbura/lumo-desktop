@@ -2,6 +2,7 @@
 .idea
 node_modules
 src-tauri/target
+tools-helper/target
 build/
 dmg/
 !src-tauri/dmg/
@@ -9,7 +10,7 @@ dmg/
 docs/
 
 # Build output: webview/ and the per-run E2E stub, built by scripts/build-webview.mjs and
-# e2e/build-stub.sh
+# e2e/build-stub.mjs
 src-tauri/dist/
 
 *.provisionprofile

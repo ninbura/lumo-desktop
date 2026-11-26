@@ -11,6 +11,12 @@ pub fn is_allowed(url: &url::Url) -> bool {
         .is_ok_and(|lumo| lumo.origin() == url.origin())
 }
 
+/// Whether a media-capture request is granted: the microphone alone, asked for by the main frame
+/// of the web app.
+pub fn grants(microphone_only: bool, main_frame: bool, origin: Option<&url::Url>) -> bool {
+    microphone_only && main_frame && origin.is_some_and(is_allowed)
+}
+
 #[cfg(target_os = "macos")]
 pub use macos::install;
 
@@ -18,8 +24,9 @@ pub use macos::install;
 mod macos {
     #![allow(unexpected_cfgs)]
 
+    use crate::macos_overrides::replace_method;
     use log::warn;
-    use objc::runtime::{class_getInstanceMethod, method_setImplementation, Imp, Object, Sel};
+    use objc::runtime::{Imp, Object, Sel};
     use objc::runtime::{BOOL, NO};
     use objc::{msg_send, sel, sel_impl};
 
@@ -55,9 +62,11 @@ mod macos {
         capture_type: isize,
         handler: *mut DecisionBlock,
     ) {
-        let grant = capture_type == WK_MEDIA_CAPTURE_TYPE_MICROPHONE
-            && is_main_frame(frame)
-            && origin_url(origin).is_some_and(|url| super::is_allowed(&url));
+        let grant = super::grants(
+            capture_type == WK_MEDIA_CAPTURE_TYPE_MICROPHONE,
+            is_main_frame(frame),
+            origin_url(origin).as_ref(),
+        );
         let decision = if grant {
             WK_PERMISSION_DECISION_GRANT
         } else {
@@ -117,16 +126,11 @@ mod macos {
                 warn!("webview has no UI delegate, microphone requests use WebKit's default");
                 return;
             }
-            let method = class_getInstanceMethod(
-                (*delegate).class(),
-                sel!(webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:),
-            );
-            if method.is_null() {
-                warn!("UI delegate has no media capture method, WebKit's default applies");
-                return;
-            }
             let imp: Imp = std::mem::transmute(request_permission as RequestPermission);
-            method_setImplementation(method as *mut _, imp);
+            let selector = sel!(webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:);
+            if replace_method((*delegate).class(), selector, imp).is_none() {
+                warn!("UI delegate has no media capture method, WebKit's default applies");
+            }
         }) {
             warn!("could not hook microphone permissions: {e}");
         }
@@ -135,7 +139,7 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed;
+    use super::{grants, is_allowed};
 
     #[test]
     fn only_the_web_app_origin_may_use_the_microphone() {
@@ -147,5 +151,17 @@ mod tests {
         assert!(!is_allowed(&url(&format!("{api}/lumo/v1/artifact-shell"))));
         assert!(!is_allowed(&url("https://evil.example/")));
         assert!(!is_allowed(&url("tauri://localhost/login.html")));
+    }
+
+    #[test]
+    fn only_the_web_apps_main_frame_gets_the_microphone_and_nothing_gets_the_camera() {
+        let web_app = crate::LUMO_URL.parse::<url::Url>().unwrap();
+        let elsewhere = "https://evil.example/".parse::<url::Url>().unwrap();
+        assert!(grants(true, true, Some(&web_app)));
+
+        assert!(!grants(false, true, Some(&web_app)), "camera, or both");
+        assert!(!grants(true, false, Some(&web_app)), "an iframe");
+        assert!(!grants(true, true, Some(&elsewhere)));
+        assert!(!grants(true, true, None), "an origin that can't be read");
     }
 }

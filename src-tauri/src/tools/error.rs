@@ -1,3 +1,4 @@
+use super::hidden_text;
 use thiserror::Error;
 
 const TRUNCATED_ERROR_NOTICE: &str =
@@ -53,37 +54,27 @@ pub enum ToolError {
 }
 
 impl ToolError {
-    /// Keep the error kind while limiting the text that can reach the model.
-    pub fn bounded_for_model(self, max_bytes: usize) -> Self {
+    /// The error as the model may see it: same kind, smuggling characters removed (a remote's
+    /// error text is as untrusted as its results) and the text bounded.
+    pub fn for_model(self, max_bytes: usize) -> Self {
+        self.map_text(|text, prefix| {
+            bound_error_text(
+                hidden_text::strip_smuggled(&text),
+                max_bytes.saturating_sub(prefix.len()),
+            )
+        })
+    }
+
+    /// Rewrites the text of variants that carry one; `prefix` is what `Display` puts before it.
+    fn map_text(self, f: impl FnOnce(String, &'static str) -> String) -> Self {
         match self {
-            Self::UnknownConnector(text) => Self::UnknownConnector(bound_error_text(
-                text,
-                max_bytes.saturating_sub("unknown connector: ".len()),
-            )),
-            Self::UnknownTool(text) => Self::UnknownTool(bound_error_text(
-                text,
-                max_bytes.saturating_sub("unknown tool: ".len()),
-            )),
-            Self::AccessDenied(text) => Self::AccessDenied(bound_error_text(
-                text,
-                max_bytes.saturating_sub("access denied: ".len()),
-            )),
-            Self::InvalidInput(text) => Self::InvalidInput(bound_error_text(
-                text,
-                max_bytes.saturating_sub("invalid input: ".len()),
-            )),
-            Self::NotReady(text) => Self::NotReady(bound_error_text(
-                text,
-                max_bytes.saturating_sub("connector is not ready: ".len()),
-            )),
-            Self::Unreachable(text) => Self::Unreachable(bound_error_text(
-                text,
-                max_bytes.saturating_sub("could not reach ".len()),
-            )),
-            Self::ExecutionFailed(text) => Self::ExecutionFailed(bound_error_text(
-                text,
-                max_bytes.saturating_sub("execution failed: ".len()),
-            )),
+            Self::UnknownConnector(text) => Self::UnknownConnector(f(text, "unknown connector: ")),
+            Self::UnknownTool(text) => Self::UnknownTool(f(text, "unknown tool: ")),
+            Self::AccessDenied(text) => Self::AccessDenied(f(text, "access denied: ")),
+            Self::InvalidInput(text) => Self::InvalidInput(f(text, "invalid input: ")),
+            Self::NotReady(text) => Self::NotReady(f(text, "connector is not ready: ")),
+            Self::Unreachable(text) => Self::Unreachable(f(text, "could not reach ")),
+            Self::ExecutionFailed(text) => Self::ExecutionFailed(f(text, "execution failed: ")),
             other => other,
         }
     }
@@ -181,6 +172,18 @@ impl AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_reach_the_model_without_smuggled_text_and_within_bounds() {
+        let smuggled = "\u{E0068}\u{E0069}";
+        let error =
+            ToolError::ExecutionFailed(format!("server said no{smuggled}")).for_model(1_000);
+        assert!(matches!(&error, ToolError::ExecutionFailed(text) if text == "server said no"));
+
+        let long = ToolError::Unreachable("x".repeat(10_000)).for_model(200);
+        assert!(long.to_string().len() <= 200);
+        assert_eq!(long.kind(), "unreachable");
+    }
 
     #[test]
     fn the_logged_kind_carries_none_of_the_error_text() {

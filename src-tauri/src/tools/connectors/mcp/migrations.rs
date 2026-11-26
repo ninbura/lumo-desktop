@@ -1,7 +1,7 @@
 //! Provider-specific upgrades for saved MCP server definitions.
 
 use super::config::{HttpAuth, McpServerConfig, McpTransport};
-use super::credentials::binding_key;
+use super::credentials::on_remove;
 use crate::tools::auth::SecretStore;
 use log::warn;
 
@@ -32,8 +32,9 @@ fn is_legacy_atlassian_url(url: &str) -> bool {
 
 /// Moves OAuth servers on a legacy Atlassian endpoint to v2, returning the ids it changed.
 ///
-/// v2 is served by a different authorization server. Clear each server's v1 credentials before
-/// changing its config; failures retain the legacy URL so the next launch retries migration.
+/// v2 is served by a different authorization server. Clear all of each server's credentials,
+/// binding included, before changing its config; failures retain the legacy URL so the next
+/// launch retries migration.
 pub async fn migrate_legacy_endpoints(
     servers: &mut [McpServerConfig],
     secrets: &dyn SecretStore,
@@ -47,13 +48,7 @@ pub async fn migrate_legacy_endpoints(
         } = &mut server.transport
         {
             if is_legacy_atlassian_url(url) {
-                let connector_id = format!("mcp-{}", server.id);
-                // Dropping the binding lets what remains carry over to the v2 URL.
-                let cleared = match secrets.delete(&connector_id).await {
-                    Ok(()) => secrets.delete(&binding_key(&connector_id)).await,
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = cleared {
+                if let Err(e) = on_remove(secrets, &server.id, &[]).await {
                     warn!(
                         "{}: failed to drop legacy OAuth credentials, will retry: {e}",
                         server.id

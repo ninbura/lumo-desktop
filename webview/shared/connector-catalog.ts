@@ -343,6 +343,16 @@ export const FEATURED_MCP_SERVERS: ConnectorCatalogEntry[] = [
     url: 'https://mcp.alphavantage.co/mcp',
   },
   {
+    id: 'mcp-13f-ai',
+    server_id: '13f-ai',
+    category: 'finance',
+    icon: '🏦',
+    iconSrc: 'images/connectors/13f-ai.svg',
+    name: '13F.ai',
+    description: 'Look up institutional investment holdings from SEC 13F filings.',
+    url: 'https://13f.ai/api/mcp',
+  },
+  {
     id: 'mcp-tavily',
     server_id: 'tavily',
     category: 'research',

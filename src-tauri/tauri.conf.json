@@ -2,10 +2,10 @@
   "identifier": "me.proton.lumo-app",
   "mainBinaryName": "lumo-desktop",
   "productName": "Lumo",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "build": {
     "beforeDevCommand": "npm run build:webview",
-    "beforeBuildCommand": "npm run build:webview",
+    "beforeBuildCommand": "npm run build:webview && node scripts/build-tools-helper.mjs",
     "frontendDist": "dist"
   },
   "app": {
@@ -51,16 +51,22 @@
     "longDescription": "",
     "linux": {
       "deb": {
+        "depends": ["libc6 (>= 2.35)"],
         "recommends": ["gnome-keyring | kwalletd6 | kwalletd5"]
       },
       "rpm": {
+        "depends": ["libc.so.6(GLIBC_2.35)(64bit)"],
         "recommends": ["gnome-keyring"]
       }
     },
     "macOS": {
       "signingIdentity": "Developer ID Application: Proton AG (2SB5Z68H26)",
       "entitlements": "./Entitlements.plist",
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "13.3",
+      "files": {
+        "Helpers/Lumo Tools.app": "target/tools-helper/Lumo Tools.app"
+      }
     },
     "windows": {
       "nsis": {

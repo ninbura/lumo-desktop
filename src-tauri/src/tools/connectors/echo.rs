@@ -1,6 +1,7 @@
 use crate::tools::auth::{AuthMechanism, Readiness};
 use crate::tools::connector_state::ToolPolicy;
 use crate::tools::error::ToolError;
+use crate::tools::exposure::{Exposure, ToolRisk};
 use crate::tools::registry::{Connector, ConnectorDescriptor, ToolDefinition, ToolRegistry};
 use async_trait::async_trait;
 use log::info;
@@ -65,6 +66,14 @@ impl Connector for EchoConnector {
         Readiness::Ready
     }
 
+    fn risk(&self, _tool_name: &str) -> ToolRisk {
+        ToolRisk {
+            exposes: Exposure::NONE,
+            sends_data: false,
+            changes_files: false,
+        }
+    }
+
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError> {
         match tool_name {
             AUTO_TOOL | ASK_TOOL => Ok(json!({ "echo": input })),
@@ -75,7 +84,7 @@ impl Connector for EchoConnector {
 
 /// The `policy` in `tools()` above is not what `dispatch` enforces — it reads
 /// `ConnectorState` instead. `ask` reaches the approval gate only because
-/// `e2e/seed-fixtures.sh` writes that policy into the state file loaded at startup.
+/// `e2e/support/fixtures.js` writes that policy into the state file loaded at startup.
 pub fn register(registry: &ToolRegistry) {
     registry.register(EchoConnector);
     info!("registered echo connector: echo__auto, echo__ask");
@@ -110,6 +119,7 @@ mod tests {
             _tool_name: &str,
             _input: &Value,
             _reason: Option<&crate::tools::exposure::ApprovalReason>,
+            _conversation: Option<&str>,
         ) -> ApprovalDecision {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.answer {

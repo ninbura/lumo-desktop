@@ -4,10 +4,11 @@ use super::super::auth::{
 };
 use super::super::connector_state::ToolPolicy;
 use super::super::error::{AuthError, ToolError};
+use super::super::exposure::{Exposure, ToolRisk};
 use super::super::icons::bundled_icon_data_uri;
 use super::super::registry::{Connector, ConnectorDescriptor, Credentialed, ToolDefinition};
 use crate::account::AccountId;
-use async_imap::types::Fetch;
+use async_imap::types::{Fetch, Name, NameAttribute};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lettre::AsyncTransport;
@@ -30,7 +31,7 @@ use message::{
     build_outgoing_message, build_search_query, full_message, limit_arg, message_summary,
     read_format_arg, recent_days_arg, recent_since_query, string_arg,
 };
-use schema::{list_schema, read_schema, search_schema, send_schema, tool};
+use schema::{list_schema, mailboxes_schema, read_schema, search_schema, send_schema, tool};
 use transport::{connect_imap, describe_connection_error, security_name, smtp_transport};
 
 pub use config::{AccountConfigFile, ConfigFile, ProtonMailConfig};
@@ -239,6 +240,26 @@ impl ProtonMailConnector {
         Ok(json!({ "mailbox": mailbox, "messages": messages }))
     }
 
+    async fn list_mailboxes(&self) -> Result<Value, ToolError> {
+        let mut session = self.with_session().await?;
+        let stream = timeout(IO_TIMEOUT, session.list(Some(""), Some("*")))
+            .await
+            .map_err(|_| ToolError::ExecutionFailed("listing mailboxes timed out".into()))?
+            .map_err(|e| ToolError::ExecutionFailed(format!("listing mailboxes failed: {e}")))?;
+        let names: Vec<Name> = timeout(IO_TIMEOUT, stream.try_collect())
+            .await
+            .map_err(|_| ToolError::ExecutionFailed("listing mailboxes timed out".into()))?
+            .map_err(|e| ToolError::ExecutionFailed(format!("listing mailboxes failed: {e}")))?;
+        let mailboxes = names
+            .iter()
+            .filter(|name| !name.attributes().contains(&NameAttribute::NoSelect))
+            .map(Name::name)
+            .collect::<Vec<_>>();
+        let result = json!({ "mailboxes": mailboxes });
+        let _ = timeout(IO_TIMEOUT, session.logout()).await;
+        Ok(result)
+    }
+
     async fn list_messages(&self, input: Value) -> Result<Value, ToolError> {
         let mailbox = string_arg(&input, "mailbox").unwrap_or("INBOX");
         let limit = limit_arg(&input)?;
@@ -313,6 +334,20 @@ impl ProtonMailConnector {
     }
 }
 
+pub(crate) fn risk(tool_name: &str) -> ToolRisk {
+    match tool_name {
+        "list_mailboxes" | "list_messages" | "search_messages" | "read_message" => ToolRisk {
+            exposes: Exposure::MAIL,
+            sends_data: false,
+            changes_files: false,
+        },
+        _ => ToolRisk {
+            exposes: Exposure::PRIVATE,
+            ..Default::default()
+        },
+    }
+}
+
 #[async_trait]
 impl Connector for ProtonMailConnector {
     fn id(&self) -> &str {
@@ -343,6 +378,10 @@ impl Connector for ProtonMailConnector {
         }
     }
 
+    fn risk(&self, tool_name: &str) -> ToolRisk {
+        risk(tool_name)
+    }
+
     fn readiness(&self) -> Readiness {
         let has_config = self
             .config
@@ -360,6 +399,12 @@ impl Connector for ProtonMailConnector {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         vec![
+            tool(
+                "list_mailboxes",
+                "List mailboxes",
+                "List the mailbox names that the other mail tools accept.",
+                mailboxes_schema(),
+            ),
             tool(
                 "list_messages",
                 "List messages",
@@ -393,6 +438,7 @@ impl Connector for ProtonMailConnector {
 
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError> {
         match tool_name {
+            "list_mailboxes" => self.list_mailboxes().await,
             "list_messages" => self.list_messages(input).await,
             "search_messages" => self.search_messages(input).await,
             "read_message" => self.read_message(input).await,

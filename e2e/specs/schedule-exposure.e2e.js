@@ -17,7 +17,7 @@ describe('scheduled runs after reading untrusted content', () => {
         try {
             await createExecutor(run.runId, true, connectors);
 
-            await startExecution('bash__run', 'scheduled', { command: 'printf untrusted-scheduled-content' });
+            await startExecution('bash__run', 'scheduled', { command: 'echo untrusted-scheduled-content' });
             expect((await executionResult())[0].is_error).toBeFalsy();
 
             const input = { marker: marker() };

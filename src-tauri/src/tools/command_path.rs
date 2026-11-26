@@ -69,6 +69,7 @@ pub use self::windows::resolve;
 #[cfg(unix)]
 mod unix {
     use super::{ResolveError, Resolved};
+    use process_wrap::tokio::{CommandWrap, ProcessSession};
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -178,19 +179,22 @@ mod unix {
     async fn probe_login_shell_path() -> Option<Vec<PathBuf>> {
         let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty())?;
         let script = format!("printf %s '{BEGIN}'; printf %s \"$PATH\"; printf %s '{END}'");
-        let output = tokio::time::timeout(
-            PROBE_TIMEOUT,
-            Command::new(shell)
-                .args(["-ilc", &script])
-                // A startup file that reads stdin would otherwise hang us until the timeout.
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        let mut command = Command::new(shell);
+        command
+            .args(["-ilc", &script])
+            // A startup file that reads stdin would otherwise hang us until the timeout.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        // Without a controlling terminal, an interactive shell cannot SIGTTIN Lumo's process group.
+        let mut command = CommandWrap::from(command);
+        command.wrap(ProcessSession);
+        let child = command.spawn().ok()?;
+        let output = tokio::time::timeout(PROBE_TIMEOUT, Box::into_pin(child.wait_with_output()))
+            .await
+            .ok()?
+            .ok()?;
         dirs_from_probe_output(&String::from_utf8_lossy(&output.stdout))
     }
 

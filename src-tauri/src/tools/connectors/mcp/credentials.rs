@@ -1,6 +1,6 @@
 //! Where an MCP server's secrets live, and how the settings form's input reaches them.
 
-use super::config::{HttpAuth, McpServerConfig, McpTransport};
+use super::config::{connector_id, HttpAuth, McpServerConfig, McpTransport};
 use crate::reporting::credential_failure;
 use crate::tools::auth::{CredentialState, SecretStore, Secrets};
 use crate::tools::error::AuthError;
@@ -16,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-const OAUTH_USER_AGENT: &str = concat!("Lumo-Desktop/", env!("CARGO_PKG_VERSION"));
+pub(super) const CLIENT_USER_AGENT: &str = concat!("Lumo-Desktop/", env!("CARGO_PKG_VERSION"));
 
 /// rmcp's default OAuth client, sending a `User-Agent`. Some authorization servers (Brandfetch
 /// behind Vercel) answer 403 to requests without one, which discovery reports as no metadata.
@@ -28,7 +28,7 @@ impl<C: OAuthHttpClient> OAuthHttpClient for UserAgentOAuthHttpClient<C> {
             .request
             .headers_mut()
             .entry(USER_AGENT)
-            .or_insert(HeaderValue::from_static(OAUTH_USER_AGENT));
+            .or_insert(HeaderValue::from_static(CLIENT_USER_AGENT));
         self.0.execute(request)
     }
 }
@@ -83,8 +83,8 @@ impl CredentialStore for KeychainCredentialStore {
 }
 
 /// What a server's secrets are released to: the URL and auth mode, or the program, arguments
-/// and environment of a stdio server. Mirrors what the settings form clears secrets on.
-pub fn destination_fingerprint(config: &McpServerConfig) -> String {
+/// and environment of a stdio server.
+pub(super) fn destination_fingerprint(config: &McpServerConfig) -> String {
     let canonical = match &config.transport {
         McpTransport::Http { url, auth, .. } => {
             let mode = match auth {
@@ -128,7 +128,7 @@ impl BoundSecrets {
         Self {
             inner,
             server_id: config.id.clone(),
-            binding_key: binding_key(&format!("mcp-{}", config.id)),
+            binding_key: binding_key(&connector_id(&config.id)),
             fingerprint: destination_fingerprint(config),
             config: config.clone(),
         }
@@ -158,25 +158,18 @@ impl SecretStore for BoundSecrets {
         self.inner.store(name, secret).await
     }
 
+    /// A missing binding withholds the secrets too: files in the config folder can get the
+    /// binding deleted (a listed pending delete, a migration), and adopting whatever destination
+    /// the config then names would hand the secrets to it.
     async fn load(&self, name: &str) -> Result<Option<String>, String> {
         match self.inner.load(&self.binding_key).await? {
             Some(bound) if bound == self.fingerprint => self.inner.load(name).await,
-            Some(_) => {
+            _ => {
                 warn!(
-                    "mcp-{}: saved credentials were for a different destination; reconnect to use this one",
+                    "mcp-{}: saved credentials aren't bound to this destination; reconnect to use it",
                     self.server_id
                 );
                 Ok(None)
-            }
-            // Saved before bindings existed: adopt the destination they are used with now.
-            None => {
-                let secret = self.inner.load(name).await?;
-                if secret.is_some() {
-                    self.inner
-                        .store(&self.binding_key, &self.fingerprint)
-                        .await?;
-                }
-                Ok(secret)
             }
         }
     }
@@ -224,7 +217,7 @@ pub(super) async fn credential_state(
     config: &McpServerConfig,
     secrets: &dyn SecretStore,
 ) -> CredentialState {
-    let id = format!("mcp-{}", config.id);
+    let id = connector_id(&config.id);
     match &config.transport {
         McpTransport::Stdio { secret_env, .. } => {
             let mut state = CredentialState::Present;
@@ -279,13 +272,63 @@ pub(super) fn client_secret_key(connector_id: &str) -> String {
     format!("{connector_id}:client_secret")
 }
 
+/// Fails on the first error so the caller can leave the config untouched: the keychain
+/// backends already treat a missing key as success, and defer a delete the keychain can't do
+/// yet, so an error means the secret could still be loaded.
+async fn delete_secrets(secrets: &dyn SecretStore, keys: &[String]) -> Result<(), String> {
+    for key in keys {
+        secrets
+            .delete(key)
+            .await
+            .map_err(|e| format!("could not clear stored credentials: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Whether stored secrets remain valid: the destination and the auth mode are both unchanged.
+/// An auth-mode change must clear them, or a token kept across token → none → token would be
+/// sent to whichever URL the last step names.
+fn keeps_credentials(before: &McpServerConfig, after: &McpServerConfig) -> bool {
+    destination_fingerprint(before) == destination_fingerprint(after)
+}
+
+/// Keys to delete before saving `next`. A first save also deletes, because a removed server
+/// may have left entries under the same id.
+fn stale_secret_keys(existing: Option<&McpServerConfig>, next: &McpServerConfig) -> Vec<String> {
+    match existing {
+        Some(previous) if keeps_credentials(previous, next) => vec![],
+        Some(previous) => secret_keys_for_id(&next.id, &[previous, next]),
+        None => secret_keys_for_id(&next.id, &[next]),
+    }
+}
+
+/// Deletes the secrets of `previous` unless `next` has the same destination and auth mode.
+/// Must run before `next` is saved; on error the caller must not save.
+pub async fn on_config_change(
+    secrets: &dyn SecretStore,
+    previous: Option<&McpServerConfig>,
+    next: &McpServerConfig,
+) -> Result<(), String> {
+    delete_secrets(secrets, &stale_secret_keys(previous, next)).await
+}
+
+/// Deletes every key `server_id` may own, including the binding. Must run before the server
+/// is removed or repointed; on error the caller must not proceed.
+pub async fn on_remove(
+    secrets: &dyn SecretStore,
+    server_id: &str,
+    configs: &[&McpServerConfig],
+) -> Result<(), String> {
+    delete_secrets(secrets, &secret_keys_for_id(server_id, configs)).await
+}
+
 /// Every key that could hold a secret for `id` under any of `configs`, plus the fixed keys any
 /// auth mode may have written.
 ///
 /// Entries whose names appear in none of `configs` (a header or env var from an older config)
 /// cannot be listed, as the keychain has no enumeration.
-pub fn secret_keys_for_id(id: &str, configs: &[&McpServerConfig]) -> Vec<String> {
-    let connector_id = format!("mcp-{id}");
+fn secret_keys_for_id(id: &str, configs: &[&McpServerConfig]) -> Vec<String> {
+    let connector_id = connector_id(id);
     let mut keys = vec![
         connector_id.clone(),
         token_key(&connector_id),
@@ -305,8 +348,8 @@ pub fn secret_keys_for_id(id: &str, configs: &[&McpServerConfig]) -> Vec<String>
 /// Wider than what `Credentialed::forget` withdraws: this includes the confidential client's
 /// secret, which is configuration that survives a disconnect but not a removal. A key absent from
 /// this list outlives the server and is inherited by the next server saved under the same id.
-pub fn secret_keys(config: &McpServerConfig) -> Vec<String> {
-    let id = format!("mcp-{}", config.id);
+pub(super) fn secret_keys(config: &McpServerConfig) -> Vec<String> {
+    let id = connector_id(&config.id);
     match &config.transport {
         McpTransport::Stdio { secret_env, .. } => secret_env
             .iter()
@@ -328,5 +371,135 @@ pub fn secret_keys(config: &McpServerConfig) -> Vec<String> {
                 keys
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::auth::{DeniedSecrets, InMemorySecrets};
+
+    fn stdio(id: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.into(),
+            display_name: id.into(),
+            description: None,
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: vec![],
+                env: Default::default(),
+                secret_env: vec![],
+            },
+        }
+    }
+
+    fn http_with(id: &str, url: &str, auth: HttpAuth) -> McpServerConfig {
+        McpServerConfig {
+            id: id.into(),
+            display_name: id.into(),
+            description: None,
+            transport: McpTransport::Http {
+                url: url.into(),
+                auth,
+                request_headers: Default::default(),
+            },
+        }
+    }
+
+    fn oauth(url: &str, scopes: &[&str]) -> McpServerConfig {
+        http_with(
+            "github",
+            url,
+            HttpAuth::Oauth {
+                scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                client_id: None,
+                resource: None,
+                authorize_params: Default::default(),
+            },
+        )
+    }
+
+    fn token(url: &str) -> McpServerConfig {
+        http_with(
+            "github",
+            url,
+            HttpAuth::Token {
+                scheme: "Bearer".into(),
+            },
+        )
+    }
+
+    fn no_auth(url: &str) -> McpServerConfig {
+        http_with("github", url, HttpAuth::None)
+    }
+
+    #[test]
+    fn secrets_stay_with_a_server_only_while_it_points_at_the_same_place() {
+        let before = oauth("https://api.example.com/mcp", &["repo"]);
+        let rescoped = oauth("https://api.example.com/mcp", &["repo", "user"]);
+        let repointed = oauth("https://evil.example/mcp", &["repo"]);
+
+        assert!(keeps_credentials(&before, &rescoped));
+        assert!(!keeps_credentials(&before, &repointed));
+        assert!(!keeps_credentials(&stdio("x", "npx"), &stdio("x", "sh")));
+        assert!(!keeps_credentials(&before, &stdio("github", "npx")));
+    }
+
+    #[tokio::test]
+    async fn a_token_does_not_survive_an_auth_mode_round_trip_to_another_url() {
+        let secrets = InMemorySecrets::with(&[("mcp-github:token", "token-for-a")]);
+        let (token_a, none_a, token_b) = (
+            token("https://a.example/mcp"),
+            no_auth("https://a.example/mcp"),
+            token("https://b.example/mcp"),
+        );
+
+        on_config_change(secrets.as_ref(), Some(&token_a), &none_a)
+            .await
+            .unwrap();
+        on_config_change(secrets.as_ref(), Some(&none_a), &token_b)
+            .await
+            .unwrap();
+
+        assert_eq!(secrets.load("mcp-github:token").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn credentials_stay_while_the_destination_and_auth_mode_are_unchanged() {
+        let secrets = InMemorySecrets::with(&[("mcp-github:token", "kept")]);
+        let before = token("https://a.example/mcp");
+        let renamed = McpServerConfig {
+            display_name: "GitHub".into(),
+            ..token("https://a.example/mcp")
+        };
+
+        on_config_change(secrets.as_ref(), Some(&before), &renamed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            secrets.load("mcp-github:token").await.unwrap().as_deref(),
+            Some("kept")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_save_sweeps_secrets_left_under_the_same_id() {
+        let secrets = InMemorySecrets::with(&[("mcp-github:token", "left-behind")]);
+        on_config_change(secrets.as_ref(), None, &token("https://b.example/mcp"))
+            .await
+            .unwrap();
+        assert_eq!(secrets.load("mcp-github:token").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_cannot_be_performed_or_deferred_stops_the_save() {
+        let denied = DeniedSecrets::shared();
+        let (before, after) = (
+            token("https://a.example/mcp"),
+            token("https://b.example/mcp"),
+        );
+        let changed = on_config_change(denied.as_ref(), Some(&before), &after).await;
+        assert!(changed.is_err());
     }
 }

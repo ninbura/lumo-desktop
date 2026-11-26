@@ -1,5 +1,6 @@
 use log::info;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
+#[cfg(not(feature = "e2e-webdriver"))]
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
@@ -43,7 +44,15 @@ pub async fn save_app_settings(
         .then(|| current_settings.search_shortcut.parse::<Shortcut>().ok())
         .flatten();
 
-    if old_active != new_active {
+    // `global_shortcut()` panics when the plugin failed to load at startup (see `app.rs`).
+    let shortcuts_available = app_handle
+        .try_state::<tauri_plugin_global_shortcut::GlobalShortcut<tauri::Wry>>()
+        .is_some();
+    if old_active != new_active && new_active.is_some() && !shortcuts_available {
+        return Err("Global shortcuts are not supported on this system".to_string());
+    }
+
+    if shortcuts_available && old_active != new_active {
         if let Some(old) = old_active {
             let _ = app_handle.global_shortcut().unregister(old);
             // global-hotkey 0.8 on X11 buffers UngrabKey without flushing; the second call's
@@ -62,6 +71,8 @@ pub async fn save_app_settings(
         }
     }
 
+    // The e2e-webdriver build never registers the autostart plugin.
+    #[cfg(not(feature = "e2e-webdriver"))]
     if current_settings.launch_at_startup != settings.launch_at_startup {
         let autostart_manager = app_handle.autolaunch();
         if settings.launch_at_startup {

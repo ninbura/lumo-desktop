@@ -39,7 +39,130 @@ pub struct ConnectorState {
     /// Conversations that have read private data or untrusted content, by conversation id.
     /// Kept so a conversation resumed after a restart is still gated; see `tools::exposure`.
     #[serde(default)]
-    pub exposed_conversations: HashMap<String, super::exposure::Exposure>,
+    pub exposed_conversations: super::exposure::Conversations,
+}
+
+/// A saved tool policy, validated against the tool's current fingerprint.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Choice {
+    /// No saved policy, or an auto-approval whose pinned fingerprint no longer matches.
+    Unset,
+    Stands(ToolPolicy),
+    /// An auto-approval with no pinned fingerprint. The caller must pin it to this fingerprint
+    /// and persist the state; otherwise the approval would follow later changes to the tool.
+    Unpinned(ToolPolicy, String),
+}
+
+impl ConnectorState {
+    /// Stores every choice explicitly, AutoApprove included: an absent entry means the tool's
+    /// declared default, which may be Ask. `fingerprint` pins an auto-approval and is `None` for
+    /// tools whose definition cannot change. Withdraws always-allow.
+    pub(super) fn choose_policy(
+        &mut self,
+        connector_id: &str,
+        tool_name: &str,
+        policy: ToolPolicy,
+        fingerprint: Option<String>,
+    ) {
+        self.tool_policies
+            .entry(connector_id.to_string())
+            .or_default()
+            .insert(tool_name.to_string(), policy);
+        let pins = self
+            .approved_tools
+            .entry(connector_id.to_string())
+            .or_default();
+        match fingerprint.filter(|_| policy == ToolPolicy::AutoApprove) {
+            Some(fingerprint) => pins.insert(tool_name.to_string(), fingerprint),
+            None => pins.remove(tool_name),
+        };
+        if let Some(tools) = self.always_allowed.get_mut(connector_id) {
+            tools.remove(tool_name);
+        }
+    }
+
+    pub(super) fn always_allow(
+        &mut self,
+        connector_id: &str,
+        tool_name: &str,
+        fingerprint: Option<String>,
+    ) {
+        self.choose_policy(
+            connector_id,
+            tool_name,
+            ToolPolicy::AutoApprove,
+            fingerprint.clone(),
+        );
+        self.always_allowed
+            .entry(connector_id.to_string())
+            .or_default()
+            .insert(tool_name.to_string(), fingerprint.unwrap_or_default());
+    }
+
+    pub(super) fn is_always_allowed(
+        &self,
+        connector_id: &str,
+        tool_name: &str,
+        fingerprint: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        let Some(pinned) = self
+            .always_allowed
+            .get(connector_id)
+            .and_then(|tools| tools.get(tool_name))
+        else {
+            return false;
+        };
+        fingerprint().is_none_or(|current| current == *pinned)
+    }
+
+    pub(super) fn tool_choice(
+        &self,
+        connector_id: &str,
+        tool_name: &str,
+        fingerprint: impl FnOnce() -> Option<String>,
+    ) -> Choice {
+        let Some(saved) = self
+            .tool_policies
+            .get(connector_id)
+            .and_then(|tools| tools.get(tool_name))
+            .copied()
+        else {
+            return Choice::Unset;
+        };
+        if saved != ToolPolicy::AutoApprove {
+            return Choice::Stands(saved);
+        }
+        let Some(current) = fingerprint() else {
+            return Choice::Stands(saved);
+        };
+        let pinned = self
+            .approved_tools
+            .get(connector_id)
+            .and_then(|tools| tools.get(tool_name));
+        match pinned {
+            Some(pinned) if *pinned != current => Choice::Unset,
+            Some(_) => Choice::Stands(saved),
+            None => Choice::Unpinned(saved, current),
+        }
+    }
+
+    pub(super) fn pin_approval(
+        &mut self,
+        connector_id: &str,
+        tool_name: &str,
+        fingerprint: String,
+    ) {
+        self.approved_tools
+            .entry(connector_id.to_string())
+            .or_default()
+            .insert(tool_name.to_string(), fingerprint);
+    }
+
+    pub(super) fn forget_tool_choices(&mut self, connector_id: &str) {
+        self.tool_policies.remove(connector_id);
+        self.approved_tools.remove(connector_id);
+        self.always_allowed.remove(connector_id);
+    }
 }
 
 pub fn connector_state_path(

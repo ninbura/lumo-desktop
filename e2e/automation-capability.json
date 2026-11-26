@@ -1,0 +1,6 @@
+{
+  "identifier": "e2e-automation",
+  "description": "Local stub automation, loaded only by the e2e-webdriver feature",
+  "windows": ["lumo-window"],
+  "permissions": ["wdio:default", "wdio-webdriver:default", "notification:allow-is-permission-granted"]
+}

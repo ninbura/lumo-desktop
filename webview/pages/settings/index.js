@@ -218,7 +218,7 @@ import {
         'mcp-figma': {
             auth: 'none',
             connectHint:
-                'Connecting to the Figma desktop app… Enable Desktop MCP server in Figma (Dev Mode) if Connect fails.',
+                'Connecting to the Figma desktop app… If Connect fails, press Cmd+K (Ctrl+K on Windows) in a Figma Design file and run “Enable desktop MCP server”.',
         },
         'mcp-zendesk': {
             transport: 'stdio',
@@ -365,6 +365,11 @@ import {
         'mcp-clinical-trials': { auth: 'none' },
         'mcp-chembl': { auth: 'none' },
         'mcp-open-targets': { auth: 'none' },
+        'mcp-13f-ai': {
+            scopes: [],
+            resource: null,
+            auth: 'dcr',
+        },
     };
 
     const MCP_CATALOG = Object.fromEntries(
@@ -495,7 +500,7 @@ import {
             if (/3845|127\.0\.0\.1|connection refused|error sending request|could not reach/i.test(text)) {
                 return {
                     title: 'Figma desktop MCP is not running',
-                    body: 'In the Figma desktop app, open a Design file, press Shift+D for Dev Mode, then enable Desktop MCP server in the Inspect panel. Leave Figma open and try Connect again.',
+                    body: 'In the Figma desktop app, open a Design file, press Cmd+K (Ctrl+K on Windows), search for “MCP” and choose “Enable desktop MCP server”. Leave Figma open and try Connect again.',
                 };
             }
         }
@@ -824,12 +829,12 @@ import {
             link.href = 'https://developers.figma.com/docs/figma-mcp-server/local-server-installation/';
             link.textContent = 'Figma desktop MCP server';
             appendSetupCard(container, {
-                leadParts: ['Connects to the ', link, ' on this Mac (not Figma’s cloud OAuth server).'],
+                leadParts: ['Connects to the ', link, ' on this computer (not Figma’s cloud OAuth server).'],
                 steps: [
-                    'Open the Figma desktop app.',
-                    'Open a Design file.',
-                    'Press Shift+D for Dev Mode.',
-                    'In the Inspect panel, enable Desktop MCP server.',
+                    'Open a Design file in the Figma desktop app.',
+                    'Press Cmd+K (Ctrl+K on Windows) to open Quick actions.',
+                    'Search for “MCP” and choose “Enable desktop MCP server”.',
+                    'Leave Figma open, then click Connect.',
                 ],
             });
             container.appendChild(createFieldRow('Server URL', preset.url, 'field-value-mono'));
@@ -838,7 +843,7 @@ import {
         container.appendChild(createFieldRow('Server URL', preset.url, 'field-value-mono'));
         const info = document.createElement('p');
         info.className = 'info';
-        info.textContent = 'Connected to Figma desktop. Keep Dev Mode’s desktop MCP server enabled while you use Figma tools.';
+        info.textContent = 'Connected to Figma desktop. Keep Figma open with the desktop MCP server enabled while you use Figma tools.';
         container.appendChild(info);
     }
 
@@ -1742,10 +1747,10 @@ import {
         commandInput.type = 'text';
         commandInput.id = 'add-mcp-command';
         commandInput.placeholder = 'npx';
-        const argsInput = document.createElement('input');
-        argsInput.type = 'text';
+        const argsInput = document.createElement('textarea');
         argsInput.id = 'add-mcp-args';
-        argsInput.placeholder = '-y,@notionhq/notion-mcp-server';
+        argsInput.rows = 2;
+        argsInput.placeholder = '-y\n@notionhq/notion-mcp-server';
         const envArea = document.createElement('textarea');
         envArea.id = 'add-mcp-env';
         envArea.rows = 2;
@@ -1755,10 +1760,7 @@ import {
         secretEnvArea.rows = 2;
         secretEnvArea.placeholder = 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…';
         stdioFields.append(
-            formGrid(
-                formFieldWithControl('Command', commandInput),
-                formFieldWithControl('Args (comma-separated)', argsInput)
-            ),
+            formFieldWithControl('Args (one per line)', argsInput),
             formGrid(
                 formFieldWithControl('Environment', envArea),
                 formFieldWithControl('Secret environment', secretEnvArea)
@@ -1843,6 +1845,7 @@ import {
         descriptionField.append(fieldHint('Shared with Lumo so it can suggest this server before you connect. Don\'t include credentials.'));
         const authField = formFieldWithControl('Auth', authTypeSelect);
         authField.style.display = 'none';
+        const commandField = formFieldWithControl('Command', commandInput);
 
         container.append(
             formGrid(
@@ -1852,6 +1855,7 @@ import {
             descriptionField,
             formGrid(
                 formFieldWithControl('Transport', transportSelect),
+                commandField,
                 authField
             ),
             stdioFields,
@@ -1865,6 +1869,7 @@ import {
             stdioFields.style.display = isHttp ? 'none' : '';
             httpFields.style.display = isHttp ? '' : 'none';
             authField.style.display = isHttp ? '' : 'none';
+            commandField.style.display = isHttp ? 'none' : '';
             oauthFields.style.display = authType === 'oauth' ? '' : 'none';
             tokenFields.style.display = authType === 'token' ? '' : 'none';
             privacyNote?.classList.toggle('hidden', isHttp && authType === 'none');
@@ -2180,7 +2185,7 @@ import {
                         : `Remove ${name}? This disconnects it and deletes stored credentials.`;
                     if (!confirm(message)) return;
                     try {
-                        await invoke('remove_mcp_server', { serverId: server.id });
+                        await invoke('remove_mcp_server', { serverId: server.id, featured: Boolean(preset) });
                         closeModal();
                         await refreshData();
                     } catch (e) {
@@ -2198,7 +2203,7 @@ import {
                     // Featured presets persist their config (from the frontend
                     // catalog) before authorizing; custom servers are already saved.
                     if (preset && preset.auth === 'none' && preset.url && !connected) {
-                        await invoke('save_mcp_server', {
+                        await invoke('save_mcp_server', { featured: true,
                             server: {
                                 id: preset.server_id,
                                 display_name: preset.name,
@@ -2217,7 +2222,7 @@ import {
                             }
                             env.ZENDESK_SUBDOMAIN = subdomain;
                         }
-                        await invoke('save_mcp_server', {
+                        await invoke('save_mcp_server', { featured: true,
                             server: {
                                 id: preset.server_id,
                                 display_name: preset.name,
@@ -2241,7 +2246,7 @@ import {
                         const headers = preset.headers.map(h => ({ name: h.name, prefix: h.prefix || '' }));
                         const server = { id: preset.server_id, display_name: preset.name, transport: 'http', url, auth: { type: 'headers', headers } };
                         if (preset.request_headers) server.request_headers = preset.request_headers;
-                        await invoke('save_mcp_server', { server });
+                        await invoke('save_mcp_server', { featured: true, server });
                         preset.headers.forEach((h, i) => {
                             if (values[i]) credentials.headers[h.name] = values[i];
                         });
@@ -2275,7 +2280,7 @@ import {
                             }
                             const runner = document.getElementById('mcp-grafana-runner')?.value || 'docker';
                             const skipTlsVerify = document.getElementById('mcp-grafana-tls-skip')?.checked;
-                            await invoke('save_mcp_server', {
+                            await invoke('save_mcp_server', { featured: true,
                                 server: grafanaInstanceServerConfig(preset, grafanaUrl, runner, skipTlsVerify),
                             });
                             if (token) credentials.env = { GRAFANA_SERVICE_ACCOUNT_TOKEN: token };
@@ -2295,7 +2300,7 @@ import {
                             );
                             if (headers) server.request_headers = headers;
                             if (preset.client_id) auth.client_id = preset.client_id;
-                            await invoke('save_mcp_server', { server });
+                            await invoke('save_mcp_server', { featured: true, server });
                             if (preset.auth === 'confidential' && preset.client_secret) {
                                 credentials.client_secret = preset.client_secret;
                             }
@@ -2326,11 +2331,11 @@ import {
                             const secret = document.getElementById('mcp-client-secret')?.value.trim();
                             if (!clientId) { setModalMsg('Client ID is required.', 'error'); return; }
                             auth.client_id = clientId;
-                            await invoke('save_mcp_server', { server });
+                            await invoke('save_mcp_server', { featured: true, server });
                             if (secret) credentials.client_secret = secret;
                         } else {
                             if (preset.client_id) auth.client_id = preset.client_id;
-                            await invoke('save_mcp_server', { server });
+                            await invoke('save_mcp_server', { featured: true, server });
                             if (preset.auth === 'confidential' && preset.client_secret) {
                                 credentials.client_secret = preset.client_secret;
                             }
@@ -2412,7 +2417,7 @@ import {
                 if (transport === 'stdio') {
                     const command = document.getElementById('add-mcp-command').value.trim();
                     const argsRaw = document.getElementById('add-mcp-args').value.trim();
-                    const args = argsRaw ? argsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+                    const args = argsRaw ? argsRaw.split('\n').map(s => s.trim()).filter(Boolean) : [];
                     if (!command) { setModalMsg('Command is required.', 'error'); return; }
                     const env = parseEnvLines(document.getElementById('add-mcp-env').value);
                     const secretValues = parseEnvLines(document.getElementById('add-mcp-secret-env').value);

@@ -1,6 +1,6 @@
 [package]
 name = "lumo"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
 description = "Lumo desktop app for macOS, Windows and Linux"
 authors = ["Eamonn Maguire"]
@@ -24,7 +24,7 @@ tauri-build = { version = "^2.6.3", features = [] }
 
 [dependencies]
 semver = "1"
-tauri = { version = "^2.11.4", features = ["tray-icon", "macos-private-api", "unstable", "image-png"] }
+tauri = { version = "^2.12.7", features = ["tray-icon", "macos-private-api", "unstable", "image-png"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
 reqwest = { version = "0.13.4", features = ["json"] }
@@ -63,9 +63,14 @@ tauri-plugin-log = "^2.7.0"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = { version = "^2", features = ["deep-link"] }
 tauri-plugin-updater = "^2.10.1"
+# Only compiled in with the `e2e-webdriver` feature.
+tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
+tauri-plugin-wdio = { version = "=1.5.1", optional = true }
 
 [features]
 test-utils = []
+# Explicit opt-in: automation is absent from ordinary application builds.
+e2e-webdriver = ["dep:tauri-plugin-wdio-webdriver", "dep:tauri-plugin-wdio", "tauri/dynamic-acl"]
 
 [lints.rust]
 # objc 0.2's macros check a `cargo-clippy` feature that current rustc does not know.
@@ -76,6 +81,7 @@ keyring = { version = "3.6.2", features = ["apple-native", "sync-secret-service"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+libc = "0.2"
 block = "0.1"
 cocoa = "0.25"
 mac-usernotifications = "0.3.1"
@@ -88,7 +94,9 @@ dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 
 [target.'cfg(windows)'.dependencies]
-webview2-com = "0.19"
+# Must match wry's versions so the COM types are compatible with `with_webview`.
+webview2-com = "0.39"
+windows-core = "0.62"
 # Pinned to the version process-wrap already pulls in, so the build keeps one copy.
 windows = { version = "0.62.2", features = ["UI_Notifications", "Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging"] }
 

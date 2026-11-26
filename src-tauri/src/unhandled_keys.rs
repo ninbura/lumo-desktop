@@ -6,10 +6,9 @@
 //! offers such keys to the main menu and drops them; this gives `TaoView` the same `keyDown:`.
 //! https://github.com/tauri-apps/tauri/issues/10194
 
+use crate::macos_overrides::replace_method;
 use log::warn;
-use objc::runtime::{
-    class_getInstanceMethod, method_setImplementation, Class, Imp, Object, Sel, BOOL,
-};
+use objc::runtime::{Class, Imp, Object, Sel, BOOL};
 use objc::{class, msg_send, sel, sel_impl};
 
 extern "C" fn key_down(_this: &Object, _sel: Sel, event: *mut Object) {
@@ -30,12 +29,9 @@ pub fn install() {
     };
 
     unsafe {
-        let method = class_getInstanceMethod(class, sel!(keyDown:));
-        if method.is_null() {
-            warn!("TaoView has no keyDown:, unhandled keys will reach the text input system");
-            return;
-        }
         let imp: Imp = std::mem::transmute(key_down as extern "C" fn(&Object, Sel, *mut Object));
-        method_setImplementation(method as *mut _, imp);
+        if replace_method(class, sel!(keyDown:), imp).is_none() {
+            warn!("TaoView has no keyDown:, unhandled keys will reach the text input system");
+        }
     }
 }

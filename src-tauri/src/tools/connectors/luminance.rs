@@ -13,6 +13,7 @@ use super::super::auth::{
     Secrets, Stored,
 };
 use super::super::error::{AuthError, ToolError};
+use super::super::exposure::{Exposure, ToolRisk};
 use super::super::icons::bundled_icon_data_uri;
 use super::super::registry::{Connector, ConnectorDescriptor, Credentialed, ToolDefinition};
 use crate::account::AccountId;
@@ -279,6 +280,15 @@ async fn stored_credential_state(secrets: &Secrets, auth: LuminanceAuth) -> Cred
     }
 }
 
+/// Write operations can share documents with third parties, so they count as sending data.
+pub(crate) fn risk(read_only: bool) -> ToolRisk {
+    ToolRisk {
+        exposes: Exposure::PRIVATE,
+        sends_data: !read_only,
+        changes_files: false,
+    }
+}
+
 #[async_trait]
 impl Connector for LuminanceConnector {
     fn id(&self) -> &str {
@@ -321,6 +331,14 @@ impl Connector for LuminanceConnector {
 
     fn tools(&self) -> Vec<ToolDefinition> {
         OPERATIONS.iter().map(tool_definition).collect()
+    }
+
+    fn risk(&self, tool_name: &str) -> ToolRisk {
+        let read_only = OPERATIONS
+            .iter()
+            .find(|operation| operation.name == tool_name)
+            .is_some_and(|operation| tool_definition(operation).read_only == Some(true));
+        risk(read_only)
     }
 
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError> {

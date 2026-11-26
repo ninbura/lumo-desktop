@@ -89,14 +89,16 @@ pub(crate) fn strip_value(value: &mut Value) {
 }
 
 /// Removes only what can smuggle whole messages and has no visible use outside flag emoji and
-/// rare CJK variants: tag characters and selector runs. For results that otherwise reach the
-/// model unchanged.
-pub(crate) fn strip_smuggled(value: &mut Value) {
-    map_strings(value, &|text| {
-        scan(text)
-            .filter_map(|(c, hidden)| (!hidden || !(is_tag(c) || is_selector(c))).then_some(c))
-            .collect()
-    });
+/// rare CJK variants: tag characters and selector runs. For results and errors that otherwise
+/// reach the model unchanged.
+pub(crate) fn strip_smuggled(text: &str) -> String {
+    scan(text)
+        .filter_map(|(c, hidden)| (!hidden || !(is_tag(c) || is_selector(c))).then_some(c))
+        .collect()
+}
+
+pub(crate) fn strip_smuggled_value(value: &mut Value) {
+    map_strings(value, &strip_smuggled);
 }
 
 /// Writes each hidden character as a visible `[U+XXXX]`, for text a person is asked to approve.
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn strip_smuggled_leaves_other_controls_for_reveal_to_show() {
         let mut result = json!([format!("a{SMUGGLED}\u{202E}b😀\u{E0138}❤\u{FE0F}")]);
-        strip_smuggled(&mut result);
+        strip_smuggled_value(&mut result);
         assert_eq!(result, json!(["a\u{202E}b😀❤\u{FE0F}"]));
     }
 }

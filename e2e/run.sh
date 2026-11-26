@@ -28,7 +28,7 @@ docker build ${NO_CACHE:+--no-cache} -f "$repo_root/e2e/Dockerfile" -t "$image" 
 # working tree: a linux esbuild binary would otherwise overwrite the host's, and the
 # linux target dir would force a full rebuild on the host after every run.
 echo "=== running suite"
-exec docker run --rm \
+exec docker run --rm --init \
     -v "$repo_root":/work \
     -v "$clients_dir":/clients:ro \
     -v lumo-e2e-cargo:/cargo \
@@ -38,13 +38,11 @@ exec docker run --rm \
     -e CARGO_HOME=/cargo \
     -e CARGO_TARGET_DIR=/target \
     -e CLIENTS_DIR=/clients \
-    -e LUMO_APP_BINARY=/target/debug/lumo-desktop \
+    -e LUMO_E2E_ARTIFACT_DIR=/work/build/e2e \
     -e LUMO_APPROVAL_TIMEOUT_MS="${LUMO_APPROVAL_TIMEOUT_MS:-5000}" \
     -e LUMO_E2E_TIMEOUT="${LUMO_E2E_TIMEOUT:-600}" \
-    -e XDG_CONFIG_HOME=/tmp/lumo-e2e-config \
-    -e LUMO_E2E_SCRATCH=/tmp/lumo-e2e-scratch \
     -e GIT_CONFIG_COUNT=1 \
     -e GIT_CONFIG_KEY_0=safe.directory \
     -e GIT_CONFIG_VALUE_0='*' \
     "$image" \
-    /work/e2e/run-in-container.sh
+    /work/e2e/run-in-container.sh "$@"

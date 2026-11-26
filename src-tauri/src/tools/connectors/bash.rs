@@ -1,23 +1,23 @@
-use super::filesystem::sanitize_user_path;
 use crate::account::AccountId;
 use crate::settings::load_account_settings;
 use crate::tools::auth::{AuthMechanism, Readiness};
-use crate::tools::child_process::background_command;
+use crate::tools::child_process::{tool_process, Environment};
 #[cfg(not(windows))]
 use crate::tools::command_path;
 use crate::tools::connector_state::ToolPolicy;
 use crate::tools::error::ToolError;
+use crate::tools::exposure::{Exposure, ToolRisk};
 use crate::tools::icons::bundled_icon_data_uri;
+use crate::tools::path_guard::PathGuard;
 use crate::tools::registry::{Connector, ConnectorDescriptor, ToolDefinition};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::RwLock;
 use std::time::Duration;
 use tauri::AppHandle;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -26,14 +26,15 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 pub struct BashConnector {
     enabled: RwLock<bool>,
-    allowed_roots: RwLock<Vec<PathBuf>>,
+    paths: PathGuard,
 }
 
 impl BashConnector {
     pub fn new(enabled: bool, allowed_roots: Vec<PathBuf>) -> Self {
         Self {
             enabled: RwLock::new(enabled),
-            allowed_roots: RwLock::new(allowed_roots),
+            // No protected paths: a shell command can read any file the user can.
+            paths: PathGuard::new(allowed_roots, Vec::new()),
         }
     }
 
@@ -42,61 +43,16 @@ impl BashConnector {
         Self::new(enabled, allowed_roots)
     }
 
-    fn allowed_roots_for_prompt(&self) -> Vec<String> {
-        self.allowed_roots
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|path| display_root_path(path.as_path()))
-            .collect()
-    }
-
     fn resolve_workdir(&self, workdir: Option<&str>) -> Result<PathBuf, ToolError> {
-        let roots = self
-            .allowed_roots
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if roots.is_empty() {
-            return Err(ToolError::AccessDenied(
-                "no allowed directories configured for shell commands".into(),
-            ));
-        }
-
-        let candidate = match workdir {
-            Some(path) => sanitize_user_path(path)?,
-            None => roots[0].clone(),
-        };
-
-        let resolved = if candidate.is_absolute() {
-            candidate
-        } else {
-            roots[0].join(candidate)
-        };
-
-        let canonical = resolved
-            .canonicalize()
-            .map_err(|e| ToolError::AccessDenied(format!("invalid workdir: {e}")))?;
-
-        if !canonical.is_dir() {
+        // `.` resolves to the first root.
+        let dir = self.paths.resolve(workdir.unwrap_or("."))?;
+        if !dir.is_dir() {
             return Err(ToolError::InvalidInput(format!(
                 "workdir is not a directory: {}",
-                canonical.display()
+                dir.display()
             )));
         }
-
-        for root in roots.iter() {
-            let canonical_root = root
-                .canonicalize()
-                .map_err(|e| ToolError::AccessDenied(format!("invalid root: {e}")))?;
-            if canonical.starts_with(&canonical_root) {
-                return Ok(canonical);
-            }
-        }
-
-        Err(ToolError::AccessDenied(format!(
-            "workdir outside allowed roots: {}",
-            canonical.display()
-        )))
+        Ok(dir)
     }
 }
 
@@ -109,13 +65,6 @@ fn load_bash_settings(app_handle: &AppHandle, account: &AccountId) -> (bool, Vec
         .filter(|p| p.exists())
         .collect();
     (settings.bash_enabled, roots)
-}
-
-fn display_root_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
 }
 
 fn format_allowed_roots_block(roots: &[String]) -> String {
@@ -147,6 +96,13 @@ fn truncate_output(text: String) -> (String, bool) {
     (truncated, true)
 }
 
+pub(crate) fn risk() -> ToolRisk {
+    ToolRisk {
+        exposes: Exposure::SHELL,
+        ..Default::default()
+    }
+}
+
 #[async_trait]
 impl Connector for BashConnector {
     fn id(&self) -> &str {
@@ -165,7 +121,7 @@ impl Connector for BashConnector {
     }
 
     fn tools(&self) -> Vec<ToolDefinition> {
-        let roots = self.allowed_roots_for_prompt();
+        let roots = self.paths.roots_for_prompt();
         vec![ToolDefinition {
             read_only: Some(false),
             open_world: None,
@@ -196,18 +152,18 @@ impl Connector for BashConnector {
         }]
     }
 
+    fn risk(&self, _tool_name: &str) -> ToolRisk {
+        risk()
+    }
+
     fn readiness(&self) -> Readiness {
         let enabled = *self
             .enabled
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let roots = self
-            .allowed_roots
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !enabled {
             Readiness::blocked("Enable shell access")
-        } else if roots.is_empty() {
+        } else if !self.paths.has_roots() {
             Readiness::blocked("Add folders first")
         } else {
             Readiness::Ready
@@ -277,30 +233,31 @@ impl BashConnector {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut process = Command::new(program);
-            process.args(args);
+            let mut process = tool_process(program, Environment::Inherited);
+            process.command_mut().args(args);
             process
         } else {
             #[cfg(windows)]
-            let mut process = Command::new("cmd");
+            let mut process = tool_process("cmd", Environment::Inherited);
             #[cfg(windows)]
-            process.args(["/C", command]);
+            process.command_mut().args(["/C", command]);
             #[cfg(not(windows))]
-            let mut process = Command::new("sh");
+            let mut process = tool_process("sh", Environment::Inherited);
             #[cfg(not(windows))]
-            process.args(["-c", command]);
+            process.command_mut().args(["-c", command]);
             process
         };
-        process.current_dir(&cwd);
+        let configured = process.command_mut();
+        configured.current_dir(&cwd);
         #[cfg(not(windows))]
-        process.env("PATH", command_path::search_path().await);
+        configured.env("PATH", command_path::search_path().await);
 
         // Match Command::output's stdio defaults while retaining the process wrappers.
-        process
+        configured
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = background_command(process)
+        let mut child = process
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         let mut stdout_pipe = child

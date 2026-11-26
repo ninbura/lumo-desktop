@@ -7,7 +7,7 @@
 //
 // dist/ is gitignored and rebuilt every run, so it cannot drift from its sources. Some
 // bundles are include_str!'d into the binary; see src-tauri/src/main_window.rs. The E2E stub is
-// written into dist/ before this runs (e2e/build-stub.sh), so only the folders this script
+// written into dist/ before this runs (e2e/build-stub.mjs), so only the folders this script
 // owns are cleared.
 //
 // Types are not checked here: esbuild erases them. `npm run typecheck` is the gate.

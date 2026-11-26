@@ -1,6 +1,28 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.10]
+
+### Added
+
+- Documents: PDF export on Windows and Linux.
+- Connectors: Proton Mail can list mailboxes.
+
+### Changed
+
+- macOS: Commands and local connectors now ask for access to folders as "Lumo Tools", separately from Lumo.
+- Connectors: Connector tools are loaded on demand instead of with every request.
+- MCP: Custom MCP server arguments are entered one per line instead of comma-separated.
+- MCP: OAuth uses the scopes advertised by the server when none are configured.
+- Linux: Packages now install on Ubuntu 22.04 and later.
+
+### Fixed
+
+- Sign-in: A sign-in left over from an earlier attempt, or a late browser callback, no longer replaces the current one.
+- MCP: Servers that reject the connection as unauthorized are no longer shown as connected.
+- MCP: OAuth requests send a user agent, fixing servers that refused requests without one.
+- Windows: The quick-ask bar shows on every Ctrl+L.
+- Linux: Lumo no longer freezes when launched from a shell.
+- Linux: Fixed a crash on Wayland with NVIDIA graphics.
 
 ## [0.5.9]
 

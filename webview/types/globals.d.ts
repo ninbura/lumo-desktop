@@ -43,6 +43,8 @@ declare global {
     __lumoDownloadFeedback?: (result: { id: string | null; name: string | null; success: boolean; mac: boolean }) => void;
     LumoSkillRuntime?: SkillRuntime;
     LumoQuickAsk?: LumoQuickAskApi;
+    /** Set by the quick-ask window; the shell calls it each time it shows that window. */
+    __lumoRevealSearch?: () => void;
     __lumoAccountIdentity?: AccountIdentity;
     /** Gateway base path override for the browser build. */
     LUMO_CONNECTOR_API?: string;

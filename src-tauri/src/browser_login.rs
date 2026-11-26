@@ -146,7 +146,8 @@ pub(super) fn random_bytes<const N: usize>() -> [u8; N] {
     buffer
 }
 
-/// What the webview needs to redeem the fork, held until sign-in completes.
+/// What the webview needs to redeem the fork, held until the callback or a new sign-in.
+#[derive(Clone)]
 struct Handoff {
     selector: String,
     key: Vec<u8>,
@@ -269,22 +270,56 @@ fn finish(app_handle: &AppHandle, handoff: &Handoff) -> Result<(), String> {
     Ok(())
 }
 
-/// Start browser sign-in, or complete one already in progress.
+/// Start browser sign-in, or with `redeem`, complete the one in progress.
 ///
-/// Completion normally arrives via [`handle_deep_link`]. A second request also completes it,
-/// since browsers may refuse a scheme redirect that no user action triggered.
+/// Completion normally arrives via [`handle_deep_link`]. `redeem` covers browsers that refuse a
+/// scheme redirect no user action triggered. Without it a new sign-in replaces any pending one,
+/// so a handoff left over from an earlier sign-in is never redeemed.
 #[tauri::command]
-pub fn start_browser_login(app_handle: AppHandle) {
-    if take_and_finish(&app_handle, None) {
+pub fn start_browser_login(app_handle: AppHandle, redeem: bool) {
+    if redeem && finish_pending(&app_handle) {
         return;
     }
 
     begin_browser_login(&app_handle);
 }
 
-/// Skips the pending handoff that [`start_browser_login`] would complete, which on a switch
-/// belongs to the outgoing account. Spawns because the navigation handler runs on the UI thread.
+/// Hand the pending sign-in to the webview without consuming it.
+///
+/// The request can come before account has deposited the fork, which fails redemption with
+/// `Invalid selector`. Keeping the handoff lets the callback or another request complete it.
+fn finish_pending(app_handle: &AppHandle) -> bool {
+    let handoff = match app_handle.state::<PendingHandoff>().0.lock() {
+        Ok(slot) => slot.clone(),
+        Err(_) => {
+            error!("pending handoff lock poisoned");
+            return false;
+        }
+    };
+
+    let Some(handoff) = handoff else {
+        return false;
+    };
+
+    if let Err(e) = finish(app_handle, &handoff) {
+        error!("{e}");
+    }
+
+    true
+}
+
+/// Drop the pending sign-in, so neither the callback nor a request can redeem it.
+pub fn discard_pending(app_handle: &AppHandle) {
+    match app_handle.state::<PendingHandoff>().0.lock() {
+        Ok(mut slot) => *slot = None,
+        Err(_) => error!("pending handoff lock poisoned"),
+    }
+}
+
+/// Discards the pending handoff first, so one left over from an earlier sign-in is not redeemed
+/// if this one fails to start. Spawns because the navigation handler runs on the UI thread.
 pub fn begin_browser_login(app_handle: &AppHandle) {
+    discard_pending(app_handle);
     let app_handle = app_handle.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = begin(app_handle).await {
@@ -293,10 +328,10 @@ pub fn begin_browser_login(app_handle: &AppHandle) {
     });
 }
 
-/// Hand a pending sign-in to the webview, requiring `expected_state` to match when given.
+/// Hand a pending sign-in to the webview, requiring `expected_state` to match.
 ///
 /// Returns whether a pending handoff was consumed.
-fn take_and_finish(app_handle: &AppHandle, expected_state: Option<&str>) -> bool {
+fn take_and_finish(app_handle: &AppHandle, expected_state: &str) -> bool {
     let pending = app_handle.state::<PendingHandoff>();
     let Ok(mut slot) = pending.0.lock() else {
         error!("pending handoff lock poisoned");
@@ -307,7 +342,7 @@ fn take_and_finish(app_handle: &AppHandle, expected_state: Option<&str>) -> bool
         return false;
     };
 
-    if expected_state.is_some_and(|expected| expected != handoff.state) {
+    if expected_state != handoff.state {
         warn!("ignoring callback with an unrecognised state");
         *slot = Some(handoff);
         return false;
@@ -339,7 +374,7 @@ pub fn handle_deep_link(app_handle: &AppHandle, urls: &[url::Url]) {
 
         match state {
             Some(state) => {
-                if !take_and_finish(app_handle, Some(&state)) {
+                if !take_and_finish(app_handle, &state) {
                     warn!("callback did not match a sign-in in progress");
                 }
             }

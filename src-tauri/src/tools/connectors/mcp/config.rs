@@ -95,6 +95,11 @@ pub fn validate_server_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Registry id of a saved server, and the prefix of its keychain keys.
+pub fn connector_id(server_id: &str) -> String {
+    format!("mcp-{server_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct McpServersFile {
     #[serde(default)]

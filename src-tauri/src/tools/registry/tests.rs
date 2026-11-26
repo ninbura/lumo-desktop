@@ -211,6 +211,7 @@ impl ApprovalGate for Answer {
         _tool_name: &str,
         _input: &Value,
         _reason: Option<&ApprovalReason>,
+        _conversation: Option<&str>,
     ) -> ApprovalDecision {
         self.0
     }
@@ -598,7 +599,7 @@ fn read_only_access_is_checked_again_on_transport_retry() {
 fn missing_approval_gate_denies_the_request() {
     let registry = ToolRegistry::new();
     assert_eq!(
-        block_on(registry.request_approval("connector", "tool", &Value::Null, None)),
+        block_on(registry.request_approval("connector", "tool", &Value::Null, None, None)),
         ApprovalDecision::Deny
     );
 }
@@ -949,6 +950,23 @@ fn oversized_tool_error_is_bounded_for_the_model() {
     assert!(shown.ends_with(":end"));
     assert!(shown.contains("Tool error truncated; middle omitted"));
     assert!(!shown.contains('\u{fffd}'));
+}
+
+#[test]
+fn smuggled_text_is_stripped_from_every_connectors_results_and_errors() {
+    let smuggled = "\u{E0068}\u{E0069}";
+    let registry = ToolRegistry::new();
+    registry.register(FakeConnector::new("filesystem").invoking(vec![
+        Ok(json!({ "content": format!("notes{smuggled}") })),
+        Err(ToolError::ExecutionFailed(format!(
+            "no such file{smuggled}"
+        ))),
+    ]));
+
+    let result = block_on(registry.dispatch("filesystem", "probe", Value::Null)).unwrap();
+    assert_eq!(result, json!({ "content": "notes" }));
+    let error = block_on(registry.dispatch("filesystem", "probe", Value::Null)).unwrap_err();
+    assert_eq!(error.to_ipc_string(), "execution failed: no such file");
 }
 
 #[derive(Default)]

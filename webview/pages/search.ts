@@ -70,6 +70,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   reveal();
 
+  // The shell calls this on every show. `focus` alone is not enough: on Windows the native window
+  // can be focused without WebView2 getting focus, so the page never hears about it and the pill
+  // would stay stowed (an invisible window holding focus until clicked).
+  window.__lumoRevealSearch = reveal;
   window.addEventListener('focus', reveal);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') reveal();

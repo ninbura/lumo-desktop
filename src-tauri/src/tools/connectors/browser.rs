@@ -1,5 +1,6 @@
 use crate::tools::auth::{AuthMechanism, Readiness};
 use crate::tools::error::ToolError;
+use crate::tools::exposure::{Exposure, RequestUrl, ToolRisk};
 use crate::tools::icons::bundled_icon_data_uri;
 use crate::tools::registry::{Connector, ConnectorDescriptor, ToolDefinition};
 use async_trait::async_trait;
@@ -108,6 +109,35 @@ impl BrowserConnector {
     }
 }
 
+pub(crate) fn risk() -> ToolRisk {
+    ToolRisk {
+        exposes: Exposure::WEB,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn request_url(tool_name: &str, input: &Value) -> Option<RequestUrl> {
+    let is_empty = |key: &str| match input.get(key) {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(map)) => map.is_empty(),
+        Some(_) => false,
+    };
+    let plain_get = match tool_name {
+        "navigate" => true,
+        "fetch" => {
+            input
+                .get("method")
+                .and_then(Value::as_str)
+                .is_none_or(|method| method.eq_ignore_ascii_case("GET"))
+                && is_empty("headers")
+                && is_empty("body")
+        }
+        _ => false,
+    };
+    let url = input.get("url").and_then(Value::as_str)?.to_owned();
+    Some(RequestUrl { url, plain_get })
+}
+
 #[async_trait]
 impl Connector for BrowserConnector {
     fn id(&self) -> &str {
@@ -166,6 +196,14 @@ impl Connector for BrowserConnector {
 
     fn readiness(&self) -> Readiness {
         Readiness::Ready
+    }
+
+    fn risk(&self, _tool_name: &str) -> ToolRisk {
+        risk()
+    }
+
+    fn request_url(&self, tool_name: &str, input: &Value) -> Option<RequestUrl> {
+        request_url(tool_name, input)
     }
 
     async fn invoke(&self, tool_name: &str, input: Value) -> Result<Value, ToolError> {
